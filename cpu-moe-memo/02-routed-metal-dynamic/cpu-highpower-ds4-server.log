@@ -1,0 +1,485 @@
+ds4: decode_moe profile interval=0 token(s) (DS4_DECODE_MOE_PROFILE)
+ds4: prefetch F_RDADVISE async dispatch enabled (queue=512)
+ds4: --prefill-metal-phases auto: resolved N=43 (total=145.12 GiB, always_metal=0.00 GiB, largest prefill phase=3.38 GiB, cap=96.00 GiB, headroom=14.00 GiB, budget=82.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.020 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.172 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 2905.480 ms (setup=0.268 ms commit=0.003 ms requestResidency=2905.163 ms), warmup 6.713 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+0531 20:26:27 ds4-server: context buffers 1933.21 MiB (ctx=100000, backend=metal, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=25002)
+0531 20:26:27 ds4-server: KV disk cache /tmp/q4-cpu-oc-ds4-kv (budget=8192 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
+0531 20:26:27 ds4-server: tracing session to /Users/tkhr.sait/projects/dev/logs/12-routed-metal-dynamic/q4-cpu-oc-trace.log
+0531 20:26:27 ds4-server: listening on http://127.0.0.1:8000
+0531 20:26:31 ds4-server: chat ctx=0..549:549 prompt start
+ds4: --prefill-metal-phases: prefill range 520 tokens < 1500, falling back to cpu-moe for prefill (set DS4_PREFILL_METAL_PHASES_MIN_TOKENS to override)
+0531 20:26:31 ds4-server: chat ctx=0..549:549 prefill chunk 0/549 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.001s
+ds4: thread pool n_threads=12 (DS4_THREADS)
+0531 20:26:53 ds4-server: chat ctx=0..549:549 prefill chunk 520/549 (94.7%) chunk=23.59 t/s avg=23.59 t/s 22.047s
+0531 20:26:53 ds4-server: kv cache stored tokens=520 trimmed=29 reason=cold key=token-text size=29.71 MiB save=18.4 ms
+ds4: --prefill-metal-phases: prefill range 29 tokens < 1500, falling back to cpu-moe for prefill (set DS4_PREFILL_METAL_PHASES_MIN_TOKENS to override)
+0531 20:26:55 ds4-server: chat ctx=0..549:549 prefill chunk 549/549 (100.0%) chunk=18.83 t/s avg=23.28 t/s 23.587s
+0531 20:26:55 ds4-server: chat ctx=0..549:549 prompt done 23.587s
+0531 20:27:00 ds4-server: chat ctx=549..599:50 gen=50 THINKING decoding chunk=9.95 t/s avg=9.95 t/s 5.025s
+0531 20:27:05 ds4-server: chat ctx=599..649:50 gen=100 THINKING decoding chunk=10.77 t/s avg=10.34 t/s 9.667s
+0531 20:27:09 ds4-server: chat ctx=649..699:50 gen=150 THINKING decoding chunk=11.23 t/s avg=10.62 t/s 14.120s
+0531 20:27:13 ds4-server: chat ctx=699..749:50 gen=200 THINKING decoding chunk=12.56 t/s avg=11.05 t/s 18.101s
+0531 20:27:17 ds4-server: chat ctx=749..799:50 gen=250 THINKING decoding chunk=12.56 t/s avg=11.32 t/s 22.080s
+0531 20:27:21 ds4-server: chat ctx=799..849:50 gen=300 THINKING decoding chunk=13.26 t/s avg=11.60 t/s 25.852s
+0531 20:27:25 ds4-server: chat ctx=849..899:50 gen=350 decoding chunk=12.75 t/s avg=11.76 t/s 29.772s
+0531 20:27:25 ds4-server: chat ctx=899..906:7 gen=357 decoding chunk=11.40 t/s avg=11.75 t/s 30.386s
+0531 20:27:25 ds4-server: thinking live checkpoint remembered ctx=0..549:549 live=906 visible=2380
+0531 20:27:25 ds4-server: chat ctx=0..549:549 gen=357 finish=stop 53.973s
+0531 20:27:25 ds4-server: live kv cache miss live=906 prompt=10661 common=1 reason=token-mismatch
+0531 20:27:25 ds4-server: kv cache stored tokens=906 trimmed=0 reason=evict key=thinking-visible size=34.75 MiB save=22.4 ms
+0531 20:27:25 ds4-server: chat ctx=0..10661:10661 TOOLS prompt start
+0531 20:27:25 ds4-server: chat ctx=0..10661:10661 TOOLS prefill chunk 0/10661 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.003s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 0..0, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 1..1)
+ds4: Metal model views created in 0.976 ms (mapped 3464.89 MiB from offset 5.08 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=0 added=1)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/43 (layers 0..0) prefetch=0.0 ms map+residency=79.2 ms total=79.2 ms
+0531 20:27:26 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=1/43 layers=0..0 progress 4096/10661 (38.4%) elapsed=0.598s
+0531 20:27:26 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=1/43 layers=0..0 progress 8192/10661 (76.8%) elapsed=0.876s
+0531 20:27:26 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=1/43 layers=0..0 progress 10632/10661 (99.7%) elapsed=1.084s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 1..1, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 2..2)
+ds4: Metal model views created in 1.088 ms (mapped 3456.02 MiB from offset 3469.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/43 (layers 1..1) prefetch=0.0 ms map+residency=45.8 ms total=45.9 ms
+0531 20:27:27 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=2/43 layers=1..1 progress 4096/10661 (38.4%) elapsed=1.451s
+0531 20:27:27 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=2/43 layers=1..1 progress 8192/10661 (76.8%) elapsed=1.762s
+0531 20:27:27 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=2/43 layers=1..1 progress 10632/10661 (99.7%) elapsed=1.942s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 2..2, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 3..3)
+ds4: Metal model views created in 2.253 ms (mapped 3456.02 MiB from offset 6925.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 2/43 (layers 2..2) prefetch=0.0 ms map+residency=27.8 ms total=27.8 ms
+0531 20:27:28 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=3/43 layers=2..2 progress 4096/10661 (38.4%) elapsed=2.393s
+0531 20:27:28 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=3/43 layers=2..2 progress 8192/10661 (76.8%) elapsed=2.773s
+0531 20:27:28 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=3/43 layers=2..2 progress 10632/10661 (99.7%) elapsed=3.018s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 3..3, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 4..4)
+ds4: Metal model views created in 1.645 ms (mapped 3456.02 MiB from offset 10381.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 3/43 (layers 3..3) prefetch=0.0 ms map+residency=38.4 ms total=38.4 ms
+0531 20:27:29 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=4/43 layers=3..3 progress 4096/10661 (38.4%) elapsed=3.339s
+0531 20:27:29 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=4/43 layers=3..3 progress 8192/10661 (76.8%) elapsed=3.623s
+0531 20:27:29 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=4/43 layers=3..3 progress 10632/10661 (99.7%) elapsed=3.806s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 4..4, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 5..5)
+ds4: Metal model views created in 0.166 ms (mapped 3456.02 MiB from offset 13837.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 4/43 (layers 4..4) prefetch=0.0 ms map+residency=374.4 ms total=374.4 ms
+0531 20:27:30 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=5/43 layers=4..4 progress 4096/10661 (38.4%) elapsed=4.592s
+0531 20:27:30 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=5/43 layers=4..4 progress 8192/10661 (76.8%) elapsed=4.983s
+0531 20:27:31 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=5/43 layers=4..4 progress 10632/10661 (99.7%) elapsed=5.238s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 5..5, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 6..6)
+ds4: Metal model views created in 1.057 ms (mapped 3456.02 MiB from offset 17293.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 5/43 (layers 5..5) prefetch=0.0 ms map+residency=35.4 ms total=35.4 ms
+0531 20:27:31 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=6/43 layers=5..5 progress 4096/10661 (38.4%) elapsed=5.569s
+0531 20:27:31 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=6/43 layers=5..5 progress 8192/10661 (76.8%) elapsed=5.860s
+0531 20:27:31 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=6/43 layers=5..5 progress 10632/10661 (99.7%) elapsed=6.052s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 6..6, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 7..7)
+ds4: Metal model views created in 0.116 ms (mapped 3456.02 MiB from offset 20749.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 6/43 (layers 6..6) prefetch=0.0 ms map+residency=353.7 ms total=353.7 ms
+0531 20:27:32 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=7/43 layers=6..6 progress 4096/10661 (38.4%) elapsed=6.805s
+0531 20:27:32 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=7/43 layers=6..6 progress 8192/10661 (76.8%) elapsed=7.203s
+0531 20:27:33 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=7/43 layers=6..6 progress 10632/10661 (99.7%) elapsed=7.476s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 7..7, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 8..8)
+ds4: Metal model views created in 0.192 ms (mapped 3456.02 MiB from offset 24205.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 7/43 (layers 7..7) prefetch=0.0 ms map+residency=41.8 ms total=41.8 ms
+0531 20:27:33 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=8/43 layers=7..7 progress 4096/10661 (38.4%) elapsed=7.825s
+0531 20:27:33 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=8/43 layers=7..7 progress 8192/10661 (76.8%) elapsed=8.124s
+0531 20:27:34 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=8/43 layers=7..7 progress 10632/10661 (99.7%) elapsed=8.321s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 8..8, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 9..9)
+ds4: Metal model views created in 0.116 ms (mapped 3456.02 MiB from offset 27661.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 8/43 (layers 8..8) prefetch=0.0 ms map+residency=406.3 ms total=406.3 ms
+0531 20:27:34 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=9/43 layers=8..8 progress 4096/10661 (38.4%) elapsed=9.151s
+0531 20:27:35 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=9/43 layers=8..8 progress 8192/10661 (76.8%) elapsed=9.556s
+0531 20:27:35 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=9/43 layers=8..8 progress 10632/10661 (99.7%) elapsed=9.832s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 9..9, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 10..10)
+ds4: Metal model views created in 1.336 ms (mapped 3456.02 MiB from offset 31117.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 9/43 (layers 9..9) prefetch=0.0 ms map+residency=42.9 ms total=42.9 ms
+0531 20:27:35 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=10/43 layers=9..9 progress 4096/10661 (38.4%) elapsed=10.186s
+0531 20:27:36 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=10/43 layers=9..9 progress 8192/10661 (76.8%) elapsed=10.490s
+0531 20:27:36 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=10/43 layers=9..9 progress 10632/10661 (99.7%) elapsed=10.689s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 10..10, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 11..11)
+ds4: Metal model views created in 0.113 ms (mapped 3456.02 MiB from offset 34573.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 10/43 (layers 10..10) prefetch=0.0 ms map+residency=442.6 ms total=442.6 ms
+0531 20:27:37 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=11/43 layers=10..10 progress 4096/10661 (38.4%) elapsed=11.641s
+0531 20:27:37 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=11/43 layers=10..10 progress 8192/10661 (76.8%) elapsed=12.108s
+0531 20:27:38 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=11/43 layers=10..10 progress 10632/10661 (99.7%) elapsed=12.381s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 11..11, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 12..12)
+ds4: Metal model views created in 1.883 ms (mapped 3456.02 MiB from offset 38029.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 11/43 (layers 11..11) prefetch=0.0 ms map+residency=546.7 ms total=546.8 ms
+0531 20:27:39 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=12/43 layers=11..11 progress 4096/10661 (38.4%) elapsed=13.217s
+0531 20:27:39 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=12/43 layers=11..11 progress 8192/10661 (76.8%) elapsed=13.521s
+0531 20:27:39 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=12/43 layers=11..11 progress 10632/10661 (99.7%) elapsed=13.721s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 12..12, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 13..13)
+ds4: Metal model views created in 1.523 ms (mapped 3456.02 MiB from offset 41485.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 12/43 (layers 12..12) prefetch=0.0 ms map+residency=39.1 ms total=39.1 ms
+0531 20:27:39 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=13/43 layers=12..12 progress 4096/10661 (38.4%) elapsed=14.157s
+0531 20:27:40 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=13/43 layers=12..12 progress 8192/10661 (76.8%) elapsed=14.581s
+0531 20:27:40 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=13/43 layers=12..12 progress 10632/10661 (99.7%) elapsed=14.859s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 13..13, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 14..14)
+ds4: Metal model views created in 0.160 ms (mapped 3456.02 MiB from offset 44941.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 13/43 (layers 13..13) prefetch=0.0 ms map+residency=542.0 ms total=542.0 ms
+0531 20:27:41 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=14/43 layers=13..13 progress 4096/10661 (38.4%) elapsed=15.713s
+0531 20:27:41 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=14/43 layers=13..13 progress 8192/10661 (76.8%) elapsed=16.016s
+0531 20:27:42 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=14/43 layers=13..13 progress 10632/10661 (99.7%) elapsed=16.219s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 14..14, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 15..15)
+ds4: Metal model views created in 1.027 ms (mapped 3456.02 MiB from offset 48397.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 14/43 (layers 14..14) prefetch=0.0 ms map+residency=42.4 ms total=42.4 ms
+0531 20:27:42 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=15/43 layers=14..14 progress 4096/10661 (38.4%) elapsed=16.712s
+0531 20:27:42 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=15/43 layers=14..14 progress 8192/10661 (76.8%) elapsed=17.139s
+0531 20:27:43 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=15/43 layers=14..14 progress 10632/10661 (99.7%) elapsed=17.412s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 15..15, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 16..16)
+ds4: Metal model views created in 0.114 ms (mapped 3456.02 MiB from offset 51853.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 15/43 (layers 15..15) prefetch=0.0 ms map+residency=445.7 ms total=445.7 ms
+0531 20:27:43 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=16/43 layers=15..15 progress 4096/10661 (38.4%) elapsed=18.163s
+0531 20:27:44 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=16/43 layers=15..15 progress 8192/10661 (76.8%) elapsed=18.468s
+0531 20:27:44 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=16/43 layers=15..15 progress 10632/10661 (99.7%) elapsed=18.671s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 16..16, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 17..17)
+ds4: Metal model views created in 0.121 ms (mapped 3456.02 MiB from offset 55309.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 16/43 (layers 16..16) prefetch=0.0 ms map+residency=412.2 ms total=412.3 ms
+0531 20:27:45 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=17/43 layers=16..16 progress 4096/10661 (38.4%) elapsed=19.531s
+0531 20:27:45 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=17/43 layers=16..16 progress 8192/10661 (76.8%) elapsed=19.956s
+0531 20:27:46 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=17/43 layers=16..16 progress 10632/10661 (99.7%) elapsed=20.232s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 17..17, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 18..18)
+ds4: Metal model views created in 1.766 ms (mapped 3456.02 MiB from offset 58765.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 17/43 (layers 17..17) prefetch=0.0 ms map+residency=50.1 ms total=50.1 ms
+0531 20:27:46 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=18/43 layers=17..17 progress 4096/10661 (38.4%) elapsed=20.597s
+0531 20:27:46 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=18/43 layers=17..17 progress 8192/10661 (76.8%) elapsed=20.909s
+0531 20:27:46 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=18/43 layers=17..17 progress 10632/10661 (99.7%) elapsed=21.117s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 18..18, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 19..19)
+ds4: Metal model views created in 0.099 ms (mapped 3456.02 MiB from offset 62221.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 18/43 (layers 18..18) prefetch=0.0 ms map+residency=405.1 ms total=405.1 ms
+0531 20:27:47 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=19/43 layers=18..18 progress 4096/10661 (38.4%) elapsed=21.951s
+0531 20:27:48 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=19/43 layers=18..18 progress 8192/10661 (76.8%) elapsed=22.380s
+0531 20:27:48 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=19/43 layers=18..18 progress 10632/10661 (99.7%) elapsed=22.656s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 19..19, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 20..20)
+ds4: Metal model views created in 1.265 ms (mapped 3456.02 MiB from offset 65677.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 19/43 (layers 19..19) prefetch=0.0 ms map+residency=47.7 ms total=47.7 ms
+0531 20:27:48 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=20/43 layers=19..19 progress 4096/10661 (38.4%) elapsed=23.025s
+0531 20:27:49 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=20/43 layers=19..19 progress 8192/10661 (76.8%) elapsed=23.344s
+0531 20:27:49 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=20/43 layers=19..19 progress 10632/10661 (99.7%) elapsed=23.552s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 20..20, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 21..21)
+ds4: Metal model views created in 0.108 ms (mapped 3456.02 MiB from offset 69133.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 20/43 (layers 20..20) prefetch=0.0 ms map+residency=722.4 ms total=722.4 ms
+0531 20:27:50 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=21/43 layers=20..20 progress 4096/10661 (38.4%) elapsed=24.717s
+0531 20:27:50 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=21/43 layers=20..20 progress 8192/10661 (76.8%) elapsed=25.139s
+0531 20:27:51 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=21/43 layers=20..20 progress 10632/10661 (99.7%) elapsed=25.413s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 21..21, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 22..22)
+ds4: Metal model views created in 0.116 ms (mapped 3456.02 MiB from offset 72589.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 21/43 (layers 21..21) prefetch=0.0 ms map+residency=312.2 ms total=312.2 ms
+0531 20:27:51 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=22/43 layers=21..21 progress 4096/10661 (38.4%) elapsed=26.036s
+0531 20:27:52 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=22/43 layers=21..21 progress 8192/10661 (76.8%) elapsed=26.346s
+0531 20:27:52 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=22/43 layers=21..21 progress 10632/10661 (99.7%) elapsed=26.552s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 22..22, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 23..23)
+ds4: Metal model views created in 2.086 ms (mapped 3456.02 MiB from offset 76045.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 22/43 (layers 22..22) prefetch=0.0 ms map+residency=38.9 ms total=38.9 ms
+0531 20:27:52 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=23/43 layers=22..22 progress 4096/10661 (38.4%) elapsed=26.988s
+0531 20:27:53 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=23/43 layers=22..22 progress 8192/10661 (76.8%) elapsed=27.427s
+0531 20:27:53 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=23/43 layers=22..22 progress 10632/10661 (99.7%) elapsed=27.706s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 23..23, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 24..24)
+ds4: Metal model views created in 0.177 ms (mapped 3456.02 MiB from offset 79501.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 23/43 (layers 23..23) prefetch=0.0 ms map+residency=46.4 ms total=46.4 ms
+0531 20:27:53 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=24/43 layers=23..23 progress 4096/10661 (38.4%) elapsed=28.076s
+0531 20:27:54 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=24/43 layers=23..23 progress 8192/10661 (76.8%) elapsed=28.398s
+0531 20:27:54 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=24/43 layers=23..23 progress 10632/10661 (99.7%) elapsed=28.607s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 24..24, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 25..25)
+ds4: Metal model views created in 1.421 ms (mapped 3456.02 MiB from offset 82957.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 24/43 (layers 24..24) prefetch=0.0 ms map+residency=50.3 ms total=50.3 ms
+0531 20:27:54 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=25/43 layers=24..24 progress 4096/10661 (38.4%) elapsed=29.084s
+0531 20:27:55 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=25/43 layers=24..24 progress 8192/10661 (76.8%) elapsed=29.574s
+0531 20:27:55 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=25/43 layers=24..24 progress 10632/10661 (99.7%) elapsed=29.866s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 25..25, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 26..26)
+ds4: Metal model views created in 2.725 ms (mapped 3456.02 MiB from offset 86413.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 25/43 (layers 25..25) prefetch=0.0 ms map+residency=61.0 ms total=61.0 ms
+0531 20:27:56 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=26/43 layers=25..25 progress 4096/10661 (38.4%) elapsed=30.245s
+0531 20:27:56 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=26/43 layers=25..25 progress 8192/10661 (76.8%) elapsed=30.565s
+0531 20:27:56 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=26/43 layers=25..25 progress 10632/10661 (99.7%) elapsed=30.776s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 26..26, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 27..27)
+ds4: Metal model views created in 1.016 ms (mapped 3456.02 MiB from offset 89869.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 26/43 (layers 26..26) prefetch=0.0 ms map+residency=46.8 ms total=46.8 ms
+0531 20:27:57 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=27/43 layers=26..26 progress 4096/10661 (38.4%) elapsed=31.234s
+0531 20:27:57 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=27/43 layers=26..26 progress 8192/10661 (76.8%) elapsed=31.684s
+0531 20:27:57 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=27/43 layers=26..26 progress 10632/10661 (99.7%) elapsed=31.972s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 27..27, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 28..28)
+ds4: Metal model views created in 1.601 ms (mapped 3456.02 MiB from offset 93325.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 27/43 (layers 27..27) prefetch=0.0 ms map+residency=100.0 ms total=100.0 ms
+0531 20:27:58 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=28/43 layers=27..27 progress 4096/10661 (38.4%) elapsed=32.398s
+0531 20:27:58 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=28/43 layers=27..27 progress 8192/10661 (76.8%) elapsed=32.721s
+0531 20:27:58 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=28/43 layers=27..27 progress 10632/10661 (99.7%) elapsed=32.941s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 28..28, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 29..29)
+ds4: Metal model views created in 1.145 ms (mapped 3456.02 MiB from offset 96781.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 28/43 (layers 28..28) prefetch=0.0 ms map+residency=41.5 ms total=41.5 ms
+0531 20:27:59 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=29/43 layers=28..28 progress 4096/10661 (38.4%) elapsed=33.402s
+0531 20:27:59 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=29/43 layers=28..28 progress 8192/10661 (76.8%) elapsed=33.856s
+0531 20:27:59 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=29/43 layers=28..28 progress 10632/10661 (99.7%) elapsed=34.146s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 29..29, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 30..30)
+ds4: Metal model views created in 2.431 ms (mapped 3456.02 MiB from offset 100237.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 29/43 (layers 29..29) prefetch=0.0 ms map+residency=54.2 ms total=54.2 ms
+0531 20:28:00 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=30/43 layers=29..29 progress 4096/10661 (38.4%) elapsed=34.525s
+0531 20:28:00 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=30/43 layers=29..29 progress 8192/10661 (76.8%) elapsed=34.859s
+0531 20:28:00 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=30/43 layers=29..29 progress 10632/10661 (99.7%) elapsed=35.074s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 30..30, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 31..31)
+ds4: Metal model views created in 2.019 ms (mapped 3456.02 MiB from offset 103693.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 30/43 (layers 30..30) prefetch=0.0 ms map+residency=44.0 ms total=44.0 ms
+0531 20:28:01 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=31/43 layers=30..30 progress 4096/10661 (38.4%) elapsed=35.533s
+0531 20:28:01 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=31/43 layers=30..30 progress 8192/10661 (76.8%) elapsed=35.991s
+0531 20:28:02 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=31/43 layers=30..30 progress 10632/10661 (99.7%) elapsed=36.283s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 31..31, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 32..32)
+ds4: Metal model views created in 0.202 ms (mapped 3456.02 MiB from offset 107149.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 31/43 (layers 31..31) prefetch=0.0 ms map+residency=45.5 ms total=45.5 ms
+0531 20:28:02 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=32/43 layers=31..31 progress 4096/10661 (38.4%) elapsed=36.654s
+0531 20:28:02 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=32/43 layers=31..31 progress 8192/10661 (76.8%) elapsed=36.982s
+0531 20:28:02 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=32/43 layers=31..31 progress 10632/10661 (99.7%) elapsed=37.190s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 32..32, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 33..33)
+ds4: Metal model views created in 1.432 ms (mapped 3456.02 MiB from offset 110605.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 32/43 (layers 32..32) prefetch=0.0 ms map+residency=53.5 ms total=53.5 ms
+0531 20:28:03 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=33/43 layers=32..32 progress 4096/10661 (38.4%) elapsed=37.665s
+0531 20:28:03 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=33/43 layers=32..32 progress 8192/10661 (76.8%) elapsed=38.124s
+0531 20:28:04 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=33/43 layers=32..32 progress 10632/10661 (99.7%) elapsed=38.418s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 33..33, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 34..34)
+ds4: Metal model views created in 0.826 ms (mapped 3456.02 MiB from offset 114061.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 33/43 (layers 33..33) prefetch=0.0 ms map+residency=52.6 ms total=52.6 ms
+0531 20:28:04 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=34/43 layers=33..33 progress 4096/10661 (38.4%) elapsed=38.793s
+0531 20:28:04 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=34/43 layers=33..33 progress 8192/10661 (76.8%) elapsed=39.131s
+0531 20:28:05 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=34/43 layers=33..33 progress 10632/10661 (99.7%) elapsed=39.349s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 34..34, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 35..35)
+ds4: Metal model views created in 1.925 ms (mapped 3456.02 MiB from offset 117517.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 34/43 (layers 34..34) prefetch=0.0 ms map+residency=36.6 ms total=36.6 ms
+0531 20:28:05 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=35/43 layers=34..34 progress 4096/10661 (38.4%) elapsed=39.801s
+0531 20:28:06 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=35/43 layers=34..34 progress 8192/10661 (76.8%) elapsed=40.262s
+0531 20:28:06 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=35/43 layers=34..34 progress 10632/10661 (99.7%) elapsed=40.556s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 35..35, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 36..36)
+ds4: Metal model views created in 1.021 ms (mapped 3456.02 MiB from offset 120973.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 35/43 (layers 35..35) prefetch=0.0 ms map+residency=58.4 ms total=58.4 ms
+0531 20:28:06 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=36/43 layers=35..35 progress 4096/10661 (38.4%) elapsed=40.942s
+0531 20:28:07 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=36/43 layers=35..35 progress 8192/10661 (76.8%) elapsed=41.274s
+0531 20:28:07 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=36/43 layers=35..35 progress 10632/10661 (99.7%) elapsed=41.496s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 36..36, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 37..37)
+ds4: Metal model views created in 0.579 ms (mapped 3456.02 MiB from offset 124429.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 36/43 (layers 36..36) prefetch=0.0 ms map+residency=44.3 ms total=44.3 ms
+0531 20:28:07 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=37/43 layers=36..36 progress 4096/10661 (38.4%) elapsed=41.961s
+0531 20:28:08 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=37/43 layers=36..36 progress 8192/10661 (76.8%) elapsed=42.424s
+0531 20:28:08 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=37/43 layers=36..36 progress 10632/10661 (99.7%) elapsed=42.721s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 37..37, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 38..38)
+ds4: Metal model views created in 2.043 ms (mapped 3456.02 MiB from offset 127885.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 37/43 (layers 37..37) prefetch=0.0 ms map+residency=40.1 ms total=40.1 ms
+0531 20:28:08 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=38/43 layers=37..37 progress 4096/10661 (38.4%) elapsed=43.091s
+0531 20:28:09 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=38/43 layers=37..37 progress 8192/10661 (76.8%) elapsed=43.434s
+0531 20:28:09 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=38/43 layers=37..37 progress 10632/10661 (99.7%) elapsed=43.655s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 38..38, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 39..39)
+ds4: Metal model views created in 0.614 ms (mapped 3456.02 MiB from offset 131341.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 38/43 (layers 38..38) prefetch=0.0 ms map+residency=33.3 ms total=33.3 ms
+0531 20:28:09 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=39/43 layers=38..38 progress 4096/10661 (38.4%) elapsed=44.118s
+0531 20:28:10 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=39/43 layers=38..38 progress 8192/10661 (76.8%) elapsed=44.598s
+0531 20:28:10 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=39/43 layers=38..38 progress 10632/10661 (99.7%) elapsed=44.894s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 39..39, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 40..40)
+ds4: Metal model views created in 0.260 ms (mapped 3456.02 MiB from offset 134797.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 39/43 (layers 39..39) prefetch=0.0 ms map+residency=53.4 ms total=53.4 ms
+0531 20:28:11 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=40/43 layers=39..39 progress 4096/10661 (38.4%) elapsed=45.281s
+0531 20:28:11 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=40/43 layers=39..39 progress 8192/10661 (76.8%) elapsed=45.655s
+0531 20:28:11 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=40/43 layers=39..39 progress 10632/10661 (99.7%) elapsed=45.873s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 40..40, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 41..41)
+ds4: Metal model views created in 0.259 ms (mapped 3456.02 MiB from offset 138253.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 40/43 (layers 40..40) prefetch=0.0 ms map+residency=45.1 ms total=45.1 ms
+0531 20:28:12 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=41/43 layers=40..40 progress 4096/10661 (38.4%) elapsed=46.342s
+0531 20:28:12 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=41/43 layers=40..40 progress 8192/10661 (76.8%) elapsed=46.809s
+0531 20:28:12 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=41/43 layers=40..40 progress 10632/10661 (99.7%) elapsed=47.108s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 41..41, budget 16384 MiB)
+ds4: --prefill-metal-phases: lookahead prefetch 3456 MiB across 3 hints (next layers 42..42)
+ds4: Metal model views created in 3.175 ms (mapped 3456.02 MiB from offset 141709.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 3 non-routed Metal segments, excluded 2 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 41/43 (layers 41..41) prefetch=0.0 ms map+residency=50.9 ms total=50.9 ms
+0531 20:28:13 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=42/43 layers=41..41 progress 4096/10661 (38.4%) elapsed=47.489s
+0531 20:28:13 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=42/43 layers=41..41 progress 8192/10661 (76.8%) elapsed=47.824s
+0531 20:28:13 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=42/43 layers=41..41 progress 10632/10661 (99.7%) elapsed=48.048s
+ds4: --prefill-metal-phases: prefetch 3456 MiB across 3 hints (layers 42..42, budget 16384 MiB)
+ds4: Metal model views created in 3.727 ms (mapped 11840.80 MiB from offset 145165.95 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers (keep_existing: kept=2 dropped=1 added=1)
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (141.75 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 42/43 (layers 42..42) prefetch=0.0 ms map+residency=99.4 ms total=99.4 ms
+0531 20:28:14 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=43/43 layers=42..42 progress 4096/10661 (38.4%) elapsed=48.565s
+0531 20:28:14 ds4-server: chat ctx=0..10661:10661 TOOLS prefill phase=43/43 layers=42..42 progress 8192/10661 (76.8%) elapsed=49.026s
+0531 20:28:15 ds4-server: chat ctx=0..10661:10661 TOOLS prefill chunk 10632/10661 (99.7%) chunk=215.58 t/s avg=215.57 t/s 49.321s
+ds4: Metal model views created in 0.017 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.194 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 134.272 ms (setup=0.911 ms commit=0.003 ms requestResidency=133.343 ms), warmup 0.002 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+0531 20:28:15 ds4-server: kv cache stored tokens=10632 trimmed=29 reason=cold key=token-text size=162.49 MiB save=102.9 ms
+ds4: --prefill-metal-phases: prefill range 29 tokens < 1500, falling back to cpu-moe for prefill (set DS4_PREFILL_METAL_PHASES_MIN_TOKENS to override)
+0531 20:28:19 ds4-server: chat ctx=0..10661:10661 TOOLS prefill chunk 10661/10661 (100.0%) chunk=7.43 t/s avg=200.30 t/s 53.226s
+0531 20:28:19 ds4-server: chat ctx=0..10661:10661 TOOLS prompt done 53.226s
+0531 20:28:25 ds4-server: chat ctx=10661..10711:50 gen=50 TOOLS DSML_START decoding chunk=7.27 t/s avg=7.27 t/s 6.876s
+0531 20:28:31 ds4-server: chat ctx=10711..10761:50 gen=100 TOOLS DSML_START decoding chunk=8.40 t/s avg=7.79 t/s 12.832s
+0531 20:28:37 ds4-server: chat ctx=10761..10811:50 gen=150 TOOLS DSML_START decoding chunk=8.78 t/s avg=8.10 t/s 18.524s
+0531 20:28:42 ds4-server: chat ctx=10811..10861:50 gen=200 TOOLS DSML_START decoding chunk=9.60 t/s avg=8.43 t/s 23.733s
+0531 20:28:47 ds4-server: chat ctx=10861..10911:50 gen=250 TOOLS DSML_START decoding chunk=10.11 t/s avg=8.72 t/s 28.677s
+0531 20:28:52 ds4-server: chat ctx=10911..10961:50 gen=300 TOOLS DSML_START decoding chunk=10.36 t/s avg=8.95 t/s 33.505s
+0531 20:28:57 ds4-server: chat ctx=10961..11011:50 gen=350 TOOLS DSML_START decoding chunk=10.47 t/s avg=9.14 t/s 38.281s
+0531 20:29:01 ds4-server: chat ctx=11011..11061:50 gen=400 TOOLS DSML_START decoding chunk=10.94 t/s avg=9.33 t/s 42.854s
+0531 20:29:06 ds4-server: chat ctx=11061..11111:50 gen=450 TOOLS DSML_START decoding chunk=10.83 t/s avg=9.48 t/s 47.469s
+0531 20:29:10 ds4-server: chat ctx=11111..11161:50 gen=500 TOOLS DSML_START decoding chunk=11.52 t/s avg=9.65 t/s 51.808s
+0531 20:29:15 ds4-server: chat ctx=11161..11211:50 gen=550 TOOLS DSML_START decoding chunk=10.55 t/s avg=9.73 t/s 56.547s
+0531 20:29:20 ds4-server: chat ctx=11211..11261:50 gen=600 TOOLS DSML_START decoding chunk=10.93 t/s avg=9.82 t/s 61.121s
+0531 20:29:25 ds4-server: chat ctx=11261..11311:50 gen=650 TOOLS DSML_START decoding chunk=9.77 t/s avg=9.81 t/s 66.239s
+0531 20:29:30 ds4-server: chat ctx=11311..11361:50 gen=700 TOOLS DSML_START decoding chunk=10.24 t/s avg=9.84 t/s 71.123s
+0531 20:29:34 ds4-server: chat ctx=11361..11411:50 gen=750 TOOLS DSML_START decoding chunk=10.58 t/s avg=9.89 t/s 75.847s
+0531 20:29:39 ds4-server: chat ctx=11411..11461:50 gen=800 TOOLS DSML_START decoding chunk=10.41 t/s avg=9.92 t/s 80.652s
+0531 20:29:44 ds4-server: chat ctx=11461..11511:50 gen=850 TOOLS DSML_START decoding chunk=10.34 t/s avg=9.94 t/s 85.487s
+0531 20:29:49 ds4-server: chat ctx=11511..11561:50 gen=900 TOOLS DSML_START decoding chunk=9.79 t/s avg=9.93 t/s 90.596s
+0531 20:29:54 ds4-server: chat ctx=11561..11611:50 gen=950 TOOLS DSML_START decoding chunk=10.35 t/s avg=9.96 t/s 95.427s
+0531 20:29:59 ds4-server: chat ctx=11611..11661:50 gen=1000 TOOLS DSML_START decoding chunk=9.96 t/s avg=9.96 t/s 100.445s
+0531 20:30:04 ds4-server: chat ctx=11661..11711:50 gen=1050 TOOLS DSML_START decoding chunk=10.28 t/s avg=9.97 t/s 105.309s
+0531 20:30:09 ds4-server: chat ctx=11711..11761:50 gen=1100 TOOLS DSML_START decoding chunk=10.22 t/s avg=9.98 t/s 110.201s
+0531 20:30:14 ds4-server: chat ctx=11761..11811:50 gen=1150 TOOLS DSML_START decoding chunk=10.23 t/s avg=9.99 t/s 115.088s
+0531 20:30:18 ds4-server: chat ctx=11811..11861:50 gen=1200 TOOLS DSML_START decoding chunk=10.81 t/s avg=10.02 t/s 119.712s
+0531 20:30:23 ds4-server: chat ctx=11861..11911:50 gen=1250 TOOLS DSML_START decoding chunk=10.63 t/s avg=10.05 t/s 124.418s
+0531 20:30:28 ds4-server: chat ctx=11911..11961:50 gen=1300 TOOLS DSML_START decoding chunk=10.34 t/s avg=10.06 t/s 129.252s
+0531 20:30:32 ds4-server: chat ctx=11961..12011:50 gen=1350 TOOLS DSML_START decoding chunk=10.76 t/s avg=10.08 t/s 133.897s
+0531 20:30:37 ds4-server: chat ctx=12011..12061:50 gen=1400 TOOLS DSML_START decoding chunk=10.36 t/s avg=10.09 t/s 138.726s
+0531 20:30:42 ds4-server: chat ctx=12061..12111:50 gen=1450 TOOLS DSML_START decoding chunk=10.20 t/s avg=10.10 t/s 143.628s
+0531 20:30:47 ds4-server: chat ctx=12111..12161:50 gen=1500 TOOLS DSML_START decoding chunk=9.99 t/s avg=10.09 t/s 148.633s
+0531 20:30:52 ds4-server: chat ctx=12161..12211:50 gen=1550 TOOLS DSML_START decoding chunk=10.65 t/s avg=10.11 t/s 153.330s
+0531 20:30:57 ds4-server: chat ctx=12211..12261:50 gen=1600 TOOLS DSML_START decoding chunk=10.02 t/s avg=10.11 t/s 158.318s
+0531 20:31:02 ds4-server: chat ctx=12261..12311:50 gen=1650 TOOLS DSML_START decoding chunk=10.56 t/s avg=10.12 t/s 163.054s
+0531 20:31:06 ds4-server: chat ctx=12311..12361:50 gen=1700 TOOLS DSML_START decoding chunk=10.49 t/s avg=10.13 t/s 167.820s
+0531 20:31:11 ds4-server: chat ctx=12361..12411:50 gen=1750 TOOLS DSML_START decoding chunk=10.65 t/s avg=10.14 t/s 172.515s
+0531 20:31:16 ds4-server: chat ctx=12411..12461:50 gen=1800 TOOLS DSML_START decoding chunk=10.80 t/s avg=10.16 t/s 177.143s
+0531 20:31:21 ds4-server: chat ctx=12461..12511:50 gen=1850 TOOLS DSML_START decoding chunk=8.59 t/s avg=10.11 t/s 182.965s
+0531 20:31:27 ds4-server: chat ctx=12511..12561:50 gen=1900 TOOLS DSML_START decoding chunk=8.83 t/s avg=10.07 t/s 188.626s
+0531 20:31:28 ds4-server: chat ctx=12561..12568:7 gen=1907 TOOLS DSML_START DSML_END decoding chunk=7.32 t/s avg=10.06 t/s 189.582s
+0531 20:31:28 ds4-server: tool calls ctx=0..10661:10661 n=1 raw_dsml=1 ids=[call_e7f3db90e82f01312eb0f1a317df600c] names=[write]
+0531 20:31:28 ds4-server: chat ctx=0..10661:10661 gen=1907 TOOLS DSML_START DSML_END finish=tool_calls 242.808s
+0531 20:31:28 ds4-server: chat ctx=12568..12584:16 TOOLS prompt start
+ds4: --prefill-metal-phases: prefill range 16 tokens < 1500, falling back to cpu-moe for prefill (set DS4_PREFILL_METAL_PHASES_MIN_TOKENS to override)
+0531 20:31:28 ds4-server: chat ctx=12568..12584:16 TOOLS prefill partial 0/16 (0.0%) elapsed=0.000s
+0531 20:31:30 ds4-server: chat ctx=12568..12584:16 TOOLS prefill chunk 16/16 (100.0%) chunk=8.82 t/s avg=8.81 t/s 1.815s
+0531 20:31:30 ds4-server: chat ctx=12568..12584:16 TOOLS prompt done 1.815s
+0531 20:31:38 ds4-server: chat ctx=12584..12634:50 gen=50 TOOLS decoding chunk=6.51 t/s avg=6.51 t/s 7.678s
+0531 20:31:43 ds4-server: chat ctx=12634..12678:44 gen=94 TOOLS decoding chunk=8.24 t/s avg=7.22 t/s 13.018s
+0531 20:31:43 ds4-server: chat ctx=12568..12584:16 gen=94 TOOLS finish=stop 14.834s

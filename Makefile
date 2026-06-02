@@ -1,5 +1,6 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
@@ -16,8 +17,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,9 +29,34 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_neon_i8mm.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_neon_i8mm.o
 METAL_LDLIBS := $(LDLIBS)
+endif
+
+# Decide how to enable ARMv8.6 FEAT_I8MM for ds4_neon_i8mm.c.  Evaluated
+# AFTER the platform block above so CFLAGS already includes any
+# platform-specific additions (e.g. -D_GNU_SOURCE on Linux).  Order:
+#   1. If the existing native CPU flag (-mcpu=native / -march=native) already
+#      defines __ARM_FEATURE_MATMUL_INT8 then keep it as-is.  Apple M4 with
+#      -mcpu=native is the main intended host.
+#   2. Otherwise try -march=armv8.6-a+i8mm as a generic fallback.
+#   3. If neither works, ds4_neon_i8mm.c still compiles cleanly as a stub --
+#      its SMMLA path is guarded by __ARM_FEATURE_MATMUL_INT8.
+I8MM_BUILD_FLAGS :=
+ifneq (,$(filter $(UNAME_M),aarch64 arm64))
+I8MM_NATIVE_HAS := $(shell $(CC) $(NATIVE_CPU_FLAG) -dM -E -x c /dev/null 2>/dev/null | grep -c __ARM_FEATURE_MATMUL_INT8)
+ifeq ($(I8MM_NATIVE_HAS),1)
+I8MM_BUILD_FLAGS := $(CFLAGS)
+else
+I8MM_PROBE := $(shell $(CC) -march=armv8.6-a+i8mm -E -x c /dev/null > /dev/null 2>&1 && echo yes)
+ifeq ($(I8MM_PROBE),yes)
+I8MM_BUILD_FLAGS := $(filter-out -mcpu=native -march=native,$(CFLAGS)) -march=armv8.6-a+i8mm
+endif
+endif
+endif
+ifeq ($(strip $(I8MM_BUILD_FLAGS)),)
+I8MM_BUILD_FLAGS := $(CFLAGS)
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
@@ -121,8 +147,11 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_neon_i8mm.o: ds4_neon_i8mm.c ds4_neon_i8mm.h ds4_quant_blocks.h
+	$(CC) $(I8MM_BUILD_FLAGS) -c -o $@ ds4_neon_i8mm.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -157,7 +186,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_neon_i8mm.h ds4_quant_blocks.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h

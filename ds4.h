@@ -72,6 +72,28 @@ typedef struct {
     int power_percent;
     bool warm_weights;
     bool quality;
+    bool cpu_moe;
+    int  n_cpu_moe_layers;
+    /* Prefill the model in N phases, each Metal-resident.  Mutually
+     * exclusive with --cpu-moe / --n-cpu-moe.  When != 0 the prefill path
+     * splits layers evenly across N phases, swapping Metal residency
+     * between phases.  Generation always falls back to cpu-moe so the
+     * routed expert pages stay in the OS page cache for decode.  Range:
+     *   -1  = auto (engine sizes N from sysctl iogpu.wired_limit_mb so
+     *          each phase fits the Metal wired-memory cap)
+     *    0  = disabled
+     *  1..DS4_N_LAYER = explicit phase count */
+    int  prefill_metal_phases;
+    /* Experimental: compute gen-time routed MoE experts on Metal by
+     * dynamically wiring only the router-selected experts (working set)
+     * into a dedicated residency set, backed by an LRU cache bounded by a
+     * wired budget (env DS4_ROUTED_METAL_BUDGET_MIB, default 40 GiB).
+     * Unlike the always-Metal path it never pins all 256 experts of a
+     * layer; unlike --cpu-moe it runs the GEMV on the GPU.  Applies to the
+     * CPU-MoE layers [0, n_cpu_moe_initial).  Metal backend only, default
+     * off.  Falls back to the CPU path on unsupported quant types or
+     * residency-API failure. */
+    bool routed_metal_dynamic;
     bool inspect_only;
 } ds4_engine_options;
 

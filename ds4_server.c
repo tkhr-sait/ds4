@@ -9373,6 +9373,23 @@ static void log_decode_progress(req_kind kind, int prompt_tokens, int completion
                elapsed);
     *last_t = now;
     *last_completion = completion;
+#ifndef DS4_NO_GPU
+    /* Surface the --routed-metal-dynamic LRU stats DURING generation (no-op
+     * when that path is off), so hit%/wired-peak land in the log every progress
+     * chunk independent of clean shutdown / engine_close (tmux kill-session
+     * never let engine_close run, so the end-of-run line was missing).
+     * Throttle via DS4_ROUTED_METAL_STATS_EVERY_CHUNKS (default 1 = every chunk). */
+    {
+        void ds4_gpu_routed_dyn_stats_dump(void);  /* declared in ds4_gpu.h (not included here) */
+        static int s_chunk_n = 0;
+        static int s_every = -1;
+        if (s_every < 0) {
+            const char *e = getenv("DS4_ROUTED_METAL_STATS_EVERY_CHUNKS");
+            s_every = (e && atoi(e) > 0) ? atoi(e) : 1;
+        }
+        if ((++s_chunk_n % s_every) == 0) ds4_gpu_routed_dyn_stats_dump();
+    }
+#endif
 }
 
 typedef struct {
@@ -9540,6 +9557,46 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event) return;
+    /* --prefill-metal-phases intermediate-phase progress: phase 0..N-2 only
+     * cover a subset of layers per token, so a per-chunk t/s would be the
+     * half-layer compute rate, not full-token throughput.  Emit progress
+     * without updating the rolling chunk_tps state; only the final phase's
+     * "prefill_chunk" event drives the rate counters below. */
+    if (strncmp(event, "prefill_phase_progress", 22) == 0) {
+        double now_phase = now_sec();
+        double elapsed_phase = now_phase - p->t0;
+        int display_start = p->cached_tokens;
+        if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
+        int display_total = p->prompt_tokens - display_start;
+        if (display_total <= 0) {
+            display_start = 0;
+            display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
+        }
+        int display_current_phase = current - display_start;
+        if (display_current_phase < 0) display_current_phase = 0;
+        if (display_current_phase > display_total) display_current_phase = display_total;
+        double pct_phase = display_total > 0
+                         ? 100.0 * (double)display_current_phase / (double)display_total
+                         : 100.0;
+        /* event string carries "prefill_phase_progress phase=X/N layers=A..B" */
+        const char *phase_info = event + 22;   /* skip the leading event tag */
+        while (*phase_info == ' ') phase_info++;
+        char flags_phase[64];
+        log_flags(flags_phase, sizeof(flags_phase), false, p->has_tools, false, false, false);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s prefill %s progress %d/%d (%.1f%%) elapsed=%.3fs",
+                   p->kind == REQ_CHAT ? "chat" : "completion",
+                   p->ctx,
+                   flags_phase[0] ? " " : "",
+                   flags_phase,
+                   phase_info,
+                   display_current_phase,
+                   display_total,
+                   pct_phase,
+                   elapsed_phase);
+        return;
+    }
+
     const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
@@ -9574,6 +9631,44 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
         if (p->srv && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv);
         }
+        return;
+    }
+    /* --prefill-metal-phases path splits some prompts into multiple
+     * chunked_range invocations (e.g. boundary + remainder dispatches in
+     * the tool-rebuild path).  Each invocation emits its own
+     * prefill_chunk event when its last chunk completes, but the chunk_tps
+     * computed from it reflects only that invocation's wall clock, not the
+     * full prompt's throughput.  Suppress the t/s computation for
+     * partial-completion events; only emit chunk= avg= when the full prompt
+     * has actually been prefilled (current == total). */
+    if (current > 0 && current < total) {
+        int display_start_p = p->cached_tokens;
+        if (display_start_p < 0 || display_start_p > p->prompt_tokens) display_start_p = 0;
+        int display_total_p = p->prompt_tokens - display_start_p;
+        if (display_total_p <= 0) {
+            display_start_p = 0;
+            display_total_p = p->prompt_tokens > total ? p->prompt_tokens : total;
+        }
+        int display_current_p = current - display_start_p;
+        if (display_current_p < 0) display_current_p = 0;
+        if (display_current_p > display_total_p) display_current_p = display_total_p;
+        double pct_p = display_total_p > 0 ? 100.0 * (double)display_current_p / (double)display_total_p : 100.0;
+        char flags_p[64];
+        log_flags(flags_p, sizeof(flags_p), false, p->has_tools, false, false, false);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: %s ctx=%s%s%s prefill partial %d/%d (%.1f%%) elapsed=%.3fs",
+                   p->kind == REQ_CHAT ? "chat" : "completion",
+                   p->ctx,
+                   flags_p[0] ? " " : "",
+                   flags_p,
+                   display_current_p,
+                   display_total_p,
+                   pct_p,
+                   elapsed);
+        p->last_current = current;
+        p->last_t = now;
+        p->seen = true;
+        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
         return;
     }
     int display_start = p->cached_tokens;
@@ -11388,6 +11483,47 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --cpu-moe\n"
+        "      Compute routed MoE experts on the CPU; routed expert weights stay\n"
+        "      in the OS page cache instead of Metal residency. Lets models that\n"
+        "      exceed the Metal wired-memory cap run, at the cost of CPU-bound\n"
+        "      generation. Used alone, prefill is also CPU-bound and slow; combine\n"
+        "      with --prefill-metal-phases to recover prefill throughput. Metal\n"
+        "      backend only. Equivalent to --n-cpu-moe with all layers on CPU.\n"
+        "  --n-cpu-moe N\n"
+        "      Compute the routed MoE on the CPU only for the first N layers; the\n"
+        "      remaining DS4_N_LAYER-N layers stay on Metal. Matches llama.cpp's\n"
+        "      --n-cpu-moe semantics. Smaller N keeps more layers on Metal (faster\n"
+        "      gen, larger Metal residency); larger N reduces Metal footprint at\n"
+        "      the cost of CPU-bound gen for those layers. The optimal N depends\n"
+        "      on model size, context length, and the iogpu.wired_limit_mb cap;\n"
+        "      no single sweet spot. N=0 disables CPU MoE entirely.\n"
+        "  --prefill-metal-phases auto|N\n"
+        "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
+        "      expert residency between phases. Without --n-cpu-moe, generation\n"
+        "      falls back to cpu-moe for every layer. Combined with --n-cpu-moe M\n"
+        "      (M < DS4_N_LAYER), only layers [0..M) cycle across phases; layers\n"
+        "      [M..DS4_N_LAYER) stay Metal-resident across every phase and during\n"
+        "      gen, keeping their expert tensors wired. N=1 is a valid single-\n"
+        "      phase configuration: prefill loads all routed experts onto Metal\n"
+        "      as one phase (full model resident); gen restores the cpu-moe\n"
+        "      routing so routed experts are read from the OS page cache.\n"
+        "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
+        "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
+        "      Metal backend only.\n"
+        "      Env overrides: DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB,\n"
+        "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
+        "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 300; compared\n"
+        "      against the prefill range length -- the full prompt on a cold\n"
+        "      start or the suffix when resuming an existing checkpoint --\n"
+        "      and falls back to cpu-moe prefill when shorter).\n"
+        "  --routed-metal-dynamic\n"
+        "      Experimental. Run gen-time routed MoE on Metal by dynamically\n"
+        "      wiring only the router-selected experts (LRU residency, bounded by\n"
+        "      a wired budget) instead of the CPU path.  Requires --cpu-moe or\n"
+        "      --n-cpu-moe N.  Metal backend only; default off, falls back to CPU\n"
+        "      on unsupported quant types.  Env: DS4_ROUTED_METAL_BUDGET_MIB\n"
+        "      (default 40960).\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
@@ -11562,6 +11698,19 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            c.engine.n_cpu_moe_layers = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.engine.prefill_metal_phases = -1;
+            } else {
+                c.engine.prefill_metal_phases = parse_int_arg(s, arg);
+            }
+        } else if (!strcmp(arg, "--routed-metal-dynamic")) {
+            c.engine.routed_metal_dynamic = true;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
@@ -11590,6 +11739,12 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    /* tmux kill-session sends SIGHUP to the pane's processes; catch it too so
+     * the server shuts down gracefully (g_stop_requested -> serve loop breaks ->
+     * server_close_resources -> ds4_engine_close), which is what dumps the
+     * end-of-run --routed-metal-dynamic stats line.  Without this, SIGHUP's
+     * default action killed the server before engine_close ran (no stats). */
+    sigaction(SIGHUP, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {

@@ -1,0 +1,165 @@
+ds4: --prefill-metal-phases auto: resolved N=2 (total=145.12 GiB, cap=96.00 GiB, headroom=14.00 GiB, per-phase budget=82.00 GiB)
+ds4: cpu-moe: layers 0..42 run their routed MoE on the CPU (first 43 of 43)
+ds4: Metal device Apple M4 Max, 128.00 GiB RAM
+ds4: Metal model views created in 0.012 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.130 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 2850.442 ms, warmup 4.246 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: metal backend initialized for graph diagnostics
+0519 08:37:49 ds4-server: context buffers 1896.58 MiB (ctx=100000, backend=metal, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=25002)
+0519 08:37:49 ds4-server: KV disk cache /tmp/opencode-ds4-kv (budget=8192 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048)
+0519 08:37:49 ds4-server: listening on http://127.0.0.1:8000
+0519 08:39:23 ds4-server: chat ctx=0..533:533 prompt start
+0519 08:39:24 ds4-server: chat ctx=0..533:533 prefill chunk 0/533 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.057s
+ds4: Metal model views created in 1.049 ms (mapped 72584.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.157 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 24587.341 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (74.25 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+0519 08:39:49 ds4-server: chat ctx=0..533:533 prefill chunk 533/533 (100.0%) chunk=20.74 t/s avg=20.69 t/s 25.757s
+ds4: Metal model views created in 0.027 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 1.244 ms (mapped 84416.80 MiB from offset 72589.95 MiB)
+ds4: Metal residency requested in 27502.100 ms, warmup 0.005 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (70.87 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+ds4: Metal model views created in 0.035 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.177 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 201.461 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+0519 08:40:18 ds4-server: chat ctx=0..533:533 prompt done 54.684s
+0519 08:40:18 ds4-server: kv cache stored tokens=533 trimmed=0 reason=cold size=29.86 MiB save=12.6 ms
+0519 08:40:41 ds4-server: chat ctx=0..533:533 gen=50 THINKING decoding chunk=2.20 t/s avg=2.20 t/s 22.710s
+0519 08:40:55 ds4-server: chat ctx=0..533:533 gen=100 THINKING decoding chunk=3.53 t/s avg=2.71 t/s 36.876s
+0519 08:41:07 ds4-server: chat ctx=0..533:533 gen=150 THINKING decoding chunk=4.29 t/s avg=3.09 t/s 48.530s
+0519 08:41:17 ds4-server: chat ctx=0..533:533 gen=200 THINKING decoding chunk=4.86 t/s avg=3.40 t/s 58.822s
+0519 08:41:26 ds4-server: chat ctx=0..533:533 gen=250 THINKING decoding chunk=5.59 t/s avg=3.69 t/s 67.767s
+0519 08:41:31 ds4-server: chat ctx=0..533:533 gen=291 decoding chunk=7.48 t/s avg=3.97 t/s 73.246s
+0519 08:41:32 ds4-server: thinking checkpoint canonicalization needs rebuild ctx=0..533:533 common=532 live=824 canonical=541 reason="rewrite needs rebuild: common=532 live=824 canonical=541"
+ds4: Metal model views created in 2.812 ms (mapped 72584.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.432 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 17470.587 ms, warmup 0.003 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (74.25 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+ds4: Metal model views created in 0.033 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 2.097 ms (mapped 84416.80 MiB from offset 72589.95 MiB)
+ds4: Metal residency requested in 29565.370 ms, warmup 0.002 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (70.87 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+ds4: Metal model views created in 0.021 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.189 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 244.582 ms, warmup 0.001 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+0519 08:42:21 ds4-server: thinking checkpoint canonicalized ctx=0..533:533 common=532 live=824 canonical=541 via=rebuild
+0519 08:42:21 ds4-server: chat ctx=0..533:533 gen=291 finish=stop 177.888s
+0519 08:42:21 ds4-server: kv cache stored tokens=541 trimmed=0 reason=evict size=29.97 MiB save=14.0 ms
+0519 08:42:21 ds4-server: chat ctx=0..10960:10960 TOOLS prompt start
+0519 08:42:21 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 0/10960 (0.0%) chunk=0.00 t/s avg=0.00 t/s 0.001s
+ds4: Metal model views created in 1.641 ms (mapped 72584.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.181 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 16336.204 ms, warmup 0.002 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (74.25 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+0519 08:42:41 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 2048/10960 (18.7%) chunk=105.00 t/s avg=105.00 t/s 19.505s
+0519 08:42:44 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 4096/10960 (37.4%) chunk=597.12 t/s avg=178.59 t/s 22.935s
+0519 08:42:48 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 6144/10960 (56.1%) chunk=525.50 t/s avg=228.98 t/s 26.833s
+0519 08:42:52 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 8192/10960 (74.7%) chunk=499.18 t/s avg=264.81 t/s 30.935s
+0519 08:42:57 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 10240/10960 (93.4%) chunk=478.50 t/s avg=290.78 t/s 35.215s
+0519 08:42:57 ds4-server: kv cache stored tokens=10240 trimmed=0 reason=continued size=90.58 MiB save=26.1 ms
+ds4: Metal model views created in 0.104 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 3.523 ms (mapped 84416.80 MiB from offset 72589.95 MiB)
+ds4: Metal residency requested in 20533.750 ms, warmup 0.015 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (70.87 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+0519 08:43:21 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 2048/10960 (18.7%) chunk=0.00 t/s avg=34.52 t/s 59.326s
+0519 08:43:25 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 4096/10960 (37.4%) chunk=509.12 t/s avg=64.66 t/s 63.349s
+0519 08:43:29 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 6144/10960 (56.1%) chunk=469.35 t/s avg=90.74 t/s 67.713s
+0519 08:43:34 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 8192/10960 (74.7%) chunk=453.15 t/s avg=113.41 t/s 72.232s
+0519 08:43:38 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 10240/10960 (93.4%) chunk=428.48 t/s avg=132.97 t/s 77.012s
+ds4: Metal model views created in 0.521 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.290 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 531.345 ms, warmup 0.002 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+ds4: Metal model views created in 2.514 ms (mapped 72584.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.345 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 18569.195 ms, warmup 0.016 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (74.25 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 0/2 (layers 0..20)
+0519 08:43:59 ds4-server: chat ctx=0..10960:10960 TOOLS prefill chunk 10960/10960 (100.0%) chunk=34.40 t/s avg=111.90 t/s 97.944s
+ds4: Metal model views created in 0.120 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 1.988 ms (mapped 84416.80 MiB from offset 72589.95 MiB)
+ds4: Metal residency requested in 21182.273 ms, warmup 0.009 ms
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (70.87 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: activated phase 1/2 (layers 21..42)
+ds4: Metal model views created in 0.042 ms (mapped 8.89 MiB from offset 5.08 MiB)
+ds4: Metal model views created in 0.255 ms (mapped 8384.80 MiB from offset 148621.95 MiB)
+ds4: Metal residency requested in 434.551 ms, warmup -0.000 ms
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: --cpu-moe: registered 2 non-routed Metal segments, excluded 1 routed-expert ranges (145.12 GiB) from the Metal residency set
+ds4: --prefill-metal-phases: restored gen routing (all routed on CPU)
+0519 08:44:23 ds4-server: chat ctx=0..10960:10960 TOOLS prompt done 121.496s
+0519 08:44:48 ds4-server: chat ctx=0..10960:10960 gen=50 TOOLS DSML_START decoding chunk=2.02 t/s avg=2.02 t/s 24.810s
+0519 08:45:06 ds4-server: chat ctx=0..10960:10960 gen=100 TOOLS DSML_START decoding chunk=2.68 t/s avg=2.30 t/s 43.499s
+0519 08:45:23 ds4-server: chat ctx=0..10960:10960 gen=150 TOOLS DSML_START decoding chunk=2.95 t/s avg=2.48 t/s 60.467s
+0519 08:45:40 ds4-server: chat ctx=0..10960:10960 gen=200 TOOLS DSML_START decoding chunk=3.02 t/s avg=2.60 t/s 77.008s
+0519 08:45:54 ds4-server: chat ctx=0..10960:10960 gen=250 TOOLS DSML_START decoding chunk=3.69 t/s avg=2.76 t/s 90.551s
+0519 08:46:04 ds4-server: chat ctx=0..10960:10960 gen=300 TOOLS DSML_START decoding chunk=4.66 t/s avg=2.96 t/s 101.280s
+0519 08:46:13 ds4-server: chat ctx=0..10960:10960 gen=350 TOOLS DSML_START decoding chunk=5.65 t/s avg=3.18 t/s 110.127s
+0519 08:46:22 ds4-server: chat ctx=0..10960:10960 gen=400 TOOLS DSML_START decoding chunk=5.73 t/s avg=3.37 t/s 118.846s
+0519 08:46:30 ds4-server: chat ctx=0..10960:10960 gen=450 TOOLS DSML_START decoding chunk=5.78 t/s avg=3.53 t/s 127.494s
+0519 08:46:38 ds4-server: chat ctx=0..10960:10960 gen=500 TOOLS DSML_START decoding chunk=6.60 t/s avg=3.70 t/s 135.070s
+0519 08:46:45 ds4-server: chat ctx=0..10960:10960 gen=550 TOOLS DSML_START decoding chunk=6.88 t/s avg=3.86 t/s 142.343s
+0519 08:46:53 ds4-server: chat ctx=0..10960:10960 gen=600 TOOLS DSML_START decoding chunk=6.17 t/s avg=3.99 t/s 150.442s
+0519 08:47:01 ds4-server: chat ctx=0..10960:10960 gen=650 TOOLS DSML_START decoding chunk=6.79 t/s avg=4.12 t/s 157.806s
+0519 08:47:09 ds4-server: chat ctx=0..10960:10960 gen=700 TOOLS DSML_START decoding chunk=5.88 t/s avg=4.21 t/s 166.307s
+0519 08:47:17 ds4-server: chat ctx=0..10960:10960 gen=750 TOOLS DSML_START decoding chunk=6.38 t/s avg=4.31 t/s 174.140s
+0519 08:47:25 ds4-server: chat ctx=0..10960:10960 gen=800 TOOLS DSML_START decoding chunk=6.21 t/s avg=4.39 t/s 182.190s
+0519 08:47:35 ds4-server: chat ctx=0..10960:10960 gen=850 TOOLS DSML_START decoding chunk=5.36 t/s avg=4.44 t/s 191.526s
+0519 08:47:44 ds4-server: chat ctx=0..10960:10960 gen=900 TOOLS DSML_START decoding chunk=5.42 t/s avg=4.48 t/s 200.747s
+0519 08:47:55 ds4-server: chat ctx=0..10960:10960 gen=950 TOOLS DSML_START decoding chunk=4.56 t/s avg=4.49 t/s 211.715s
+0519 08:48:03 ds4-server: chat ctx=0..10960:10960 gen=1000 TOOLS DSML_START decoding chunk=6.07 t/s avg=4.55 t/s 219.950s
+0519 08:48:12 ds4-server: chat ctx=0..10960:10960 gen=1050 TOOLS DSML_START decoding chunk=5.61 t/s avg=4.59 t/s 228.862s
+0519 08:48:18 ds4-server: chat ctx=0..10960:10960 gen=1100 TOOLS DSML_START decoding chunk=7.53 t/s avg=4.67 t/s 235.498s
+0519 08:48:26 ds4-server: chat ctx=0..10960:10960 gen=1150 TOOLS DSML_START decoding chunk=6.70 t/s avg=4.73 t/s 242.961s
+0519 08:48:33 ds4-server: chat ctx=0..10960:10960 gen=1200 TOOLS DSML_START decoding chunk=6.90 t/s avg=4.80 t/s 250.207s
+0519 08:48:41 ds4-server: chat ctx=0..10960:10960 gen=1250 TOOLS DSML_START decoding chunk=6.64 t/s avg=4.85 t/s 257.732s
+0519 08:48:47 ds4-server: chat ctx=0..10960:10960 gen=1300 TOOLS DSML_START decoding chunk=7.46 t/s avg=4.92 t/s 264.435s
+0519 08:48:55 ds4-server: chat ctx=0..10960:10960 gen=1350 TOOLS DSML_START decoding chunk=6.51 t/s avg=4.96 t/s 272.111s
+0519 08:49:02 ds4-server: chat ctx=0..10960:10960 gen=1400 TOOLS DSML_START decoding chunk=7.09 t/s avg=5.01 t/s 279.169s
+0519 08:49:10 ds4-server: chat ctx=0..10960:10960 gen=1450 TOOLS DSML_START decoding chunk=6.17 t/s avg=5.05 t/s 287.273s
+0519 08:49:17 ds4-server: chat ctx=0..10960:10960 gen=1500 TOOLS DSML_START decoding chunk=7.15 t/s avg=5.10 t/s 294.262s
+0519 08:49:24 ds4-server: chat ctx=0..10960:10960 gen=1550 TOOLS DSML_START decoding chunk=7.93 t/s avg=5.16 t/s 300.564s
+0519 08:49:30 ds4-server: chat ctx=0..10960:10960 gen=1600 TOOLS DSML_START decoding chunk=7.35 t/s avg=5.21 t/s 307.369s
+0519 08:49:38 ds4-server: chat ctx=0..10960:10960 gen=1650 TOOLS DSML_START decoding chunk=6.81 t/s avg=5.24 t/s 314.712s
+0519 08:49:46 ds4-server: chat ctx=0..10960:10960 gen=1700 TOOLS DSML_START decoding chunk=6.35 t/s avg=5.27 t/s 322.586s
+0519 08:49:52 ds4-server: chat ctx=0..10960:10960 gen=1750 TOOLS DSML_START decoding chunk=7.25 t/s avg=5.31 t/s 329.482s
+0519 08:49:59 ds4-server: chat ctx=0..10960:10960 gen=1800 TOOLS DSML_START decoding chunk=7.58 t/s avg=5.36 t/s 336.076s
+0519 08:50:06 ds4-server: chat ctx=0..10960:10960 gen=1850 TOOLS DSML_START decoding chunk=7.29 t/s avg=5.39 t/s 342.940s
+0519 08:50:15 ds4-server: chat ctx=0..10960:10960 gen=1900 TOOLS DSML_START decoding chunk=5.52 t/s avg=5.40 t/s 352.001s
+0519 08:50:23 ds4-server: chat ctx=0..10960:10960 gen=1950 TOOLS DSML_START decoding chunk=6.05 t/s avg=5.41 t/s 360.260s
+0519 08:50:31 ds4-server: chat ctx=0..10960:10960 gen=2000 TOOLS DSML_START decoding chunk=6.69 t/s avg=5.44 t/s 367.734s
+0519 08:50:41 ds4-server: chat ctx=0..10960:10960 gen=2050 TOOLS DSML_START decoding chunk=4.95 t/s avg=5.43 t/s 377.834s
+0519 08:50:53 ds4-server: chat ctx=0..10960:10960 gen=2100 TOOLS DSML_START decoding chunk=4.26 t/s avg=5.39 t/s 389.583s
+0519 08:50:57 ds4-server: chat ctx=0..10960:10960 gen=2113 TOOLS DSML_START DSML_END decoding chunk=3.20 t/s avg=5.37 t/s 393.646s
+0519 08:50:57 ds4-server: tool calls ctx=0..10960:10960 n=1 names=[write]
+0519 08:50:58 ds4-server: tool checkpoint canonicalized ctx=0..10960:10960 common=13073 live=13073 canonical=13074
+0519 08:50:58 ds4-server: chat ctx=0..10960:10960 gen=2113 TOOLS DSML_START DSML_END finish=tool_calls 516.281s
+0519 08:50:58 ds4-server: chat ctx=13074..13089:15 TOOLS prompt start
+0519 08:51:03 ds4-server: chat ctx=13074..13089:15 TOOLS prompt done 5.629s
+0519 08:51:26 ds4-server: chat ctx=13074..13089:15 gen=50 TOOLS decoding chunk=2.21 t/s avg=2.21 t/s 22.602s
+0519 08:51:31 ds4-server: chat ctx=13074..13089:15 gen=69 TOOLS decoding chunk=3.60 t/s avg=2.47 t/s 27.886s
+0519 08:51:31 ds4-server: chat ctx=13074..13089:15 gen=69 TOOLS finish=stop 33.516s

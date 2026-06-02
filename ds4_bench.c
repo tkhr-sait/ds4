@@ -38,6 +38,10 @@ typedef struct {
     const char *dump_frontier_logits_dir;
     bool warm_weights;
     bool quality;
+    bool cpu_moe;
+    int  n_cpu_moe_layers;
+    int  prefill_metal_phases;
+    bool routed_metal_dynamic;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -70,6 +74,19 @@ static void usage(FILE *fp) {
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "  --cpu-moe              Run routed MoE experts on the CPU for all layers.\n"
+        "                         Metal backend only.\n"
+        "  --n-cpu-moe N          Run routed MoE on the CPU only for the first N layers.\n"
+        "  --prefill-metal-phases auto|N\n"
+        "                         Prefill on Metal in N evenly-split phases with\n"
+        "                         residency swap between phases; generation falls\n"
+        "                         back to cpu-moe. \"auto\" picks N from sysctl\n"
+        "                         iogpu.wired_limit_mb (bounded by hw.memsize).\n"
+        "                         Mutually exclusive with --cpu-moe.\n"
+        "  --routed-metal-dynamic Experimental. Run gen-time routed MoE on Metal by\n"
+        "                         dynamically wiring only the selected experts (LRU\n"
+        "                         residency).  Requires --cpu-moe / --n-cpu-moe.\n"
+        "                         Env: DS4_ROUTED_METAL_BUDGET_MIB (default 40960).\n"
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
         "Sweep:\n"
@@ -234,6 +251,32 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT_MAX) {
+                fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", arg, s);
+                exit(2);
+            }
+            c.n_cpu_moe_layers = (int)v;
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.prefill_metal_phases = -1;
+            } else {
+                char *end = NULL;
+                long v = strtol(s, &end, 10);
+                if (s[0] == '\0' || *end != '\0' || v < 1 || v > INT_MAX) {
+                    fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", arg, s);
+                    exit(2);
+                }
+                c.prefill_metal_phases = (int)v;
+            }
+        } else if (!strcmp(arg, "--routed-metal-dynamic")) {
+            c.routed_metal_dynamic = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -402,6 +445,10 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .cpu_moe = cfg.cpu_moe,
+        .n_cpu_moe_layers = cfg.n_cpu_moe_layers,
+        .prefill_metal_phases = cfg.prefill_metal_phases,
+        .routed_metal_dynamic = cfg.routed_metal_dynamic,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

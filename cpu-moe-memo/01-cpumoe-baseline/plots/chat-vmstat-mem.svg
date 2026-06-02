@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 22px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 13px; font-weight: 600; fill: #334155; }
+.tick { font-size: 11px; fill: #64748b; }
+.legend { font-size: 12px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">chat: memory composition (vm_stat 30s)</text>
+<rect x="90.94" y="90" width="26.16" height="352" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="117.25" y="90" width="183.45" height="352" fill="#dbeafe" fill-opacity="0.55"/>
+<rect x="300.70" y="90" width="456.06" height="352" fill="#dcfce7" fill-opacity="0.55"/>
+<rect x="756.76" y="90" width="37.51" height="352" fill="#fed7aa" fill-opacity="0.55"/>
+<line x1="86" y1="442.00" x2="930" y2="442.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="446.00" text-anchor="end">0</text>
+<line x1="86" y1="324.67" x2="930" y2="324.67" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="328.67" text-anchor="end">50</text>
+<line x1="86" y1="207.33" x2="930" y2="207.33" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="211.33" text-anchor="end">100</text>
+<line x1="86" y1="90.00" x2="930" y2="90.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="94.00" text-anchor="end">150</text>
+<line x1="86.00" y1="90" x2="86.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="86.00" y="462" text-anchor="middle">0.0s</text>
+<line x1="332.78" y1="90" x2="332.78" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="332.78" y="462" text-anchor="middle">8m20s</text>
+<line x1="579.57" y1="90" x2="579.57" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="579.57" y="462" text-anchor="middle">16m40s</text>
+<line x1="826.35" y1="90" x2="826.35" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="826.35" y="462" text-anchor="middle">25m00s</text>
+<line x1="86" y1="90" x2="86" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="86" y1="442" x2="930" y2="442" stroke="#334155" stroke-width="1.2"/>
+<text class="axis-label" x="480.0" y="522" text-anchor="middle">elapsed seconds (approx. aligned to ds4-server epoch)</text>
+<text class="legend" x="86.00" y="472.00">#1 23m45s prefill=54s gen=8714@6.7t/s stop</text>
+<text class="axis-label" x="22" y="266.0" text-anchor="middle" transform="rotate(-90 22 266.0)">memory (GiB)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,372.52 100.81,352.82 115.61,412.02 130.42,411.91 145.23,412.04 160.04,412.01 174.84,412.13 189.65,412.19 204.46,412.28 219.26,412.21 234.07,412.21 248.88,412.21 263.68,412.25 278.49,411.20 293.30,411.23 308.11,411.06 322.91,411.12 337.72,411.18 352.53,411.18 367.33,411.18 382.14,411.13 396.95,411.14 411.75,411.14 426.56,411.14 441.37,411.20 456.18,411.13 470.98,411.14 485.79,411.14 500.60,411.21 515.40,411.09 530.21,411.22 545.02,410.94 559.82,411.13 574.63,411.14 589.44,411.14 604.25,411.14 619.05,411.14 633.86,411.14 648.67,411.14 663.47,411.22 678.28,411.11 693.09,410.85 707.89,410.75 722.70,330.03 737.51,381.98 752.32,235.31 767.12,434.38 781.93,434.50 796.74,435.10 811.54,434.49 826.35,433.66 841.16,433.22 855.96,434.34 870.77,435.03 885.58,434.14 900.39,434.97 915.19,434.81 930.00,434.37"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,436.06 100.81,250.34 115.61,184.42 130.42,183.94 145.23,183.69 160.04,183.21 174.84,183.14 189.65,182.88 204.46,182.79 219.26,182.80 234.07,182.67 248.88,182.74 263.68,183.41 278.49,185.24 293.30,184.66 308.11,184.42 322.91,184.78 337.72,184.74 352.53,184.53 367.33,184.37 382.14,184.66 396.95,184.40 411.75,184.30 426.56,183.93 441.37,184.98 456.18,184.82 470.98,184.39 485.79,184.08 500.60,183.98 515.40,184.01 530.21,183.91 545.02,184.49 559.82,184.57 574.63,184.23 589.44,183.96 604.25,183.98 619.05,184.08 633.86,184.01 648.67,183.97 663.47,183.86 678.28,184.89 693.09,185.45 707.89,185.24 722.70,270.08 737.51,221.23 752.32,366.33 767.12,172.94 781.93,172.91 796.74,172.86 811.54,172.94 826.35,175.10 841.16,175.68 855.96,175.92 870.77,175.78 885.58,177.13 900.39,177.06 915.19,177.06 930.00,177.06"/>
+<polyline fill="none" stroke="#9333ea" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,440.15 100.81,440.18 115.61,435.01 130.42,436.32 145.23,437.20 160.04,437.43 174.84,437.75 189.65,437.60 204.46,437.77 219.26,437.81 234.07,437.61 248.88,437.81 263.68,437.64 278.49,438.00 293.30,437.85 308.11,438.00 322.91,438.09 337.72,438.05 352.53,437.91 367.33,437.88 382.14,437.97 396.95,437.93 411.75,437.89 426.56,437.79 441.37,438.02 456.18,438.02 470.98,437.92 485.79,437.85 500.60,437.76 515.40,437.80 530.21,437.75 545.02,437.85 559.82,437.94 574.63,437.88 589.44,437.79 604.25,437.70 619.05,437.78 633.86,437.79 648.67,437.73 663.47,437.73 678.28,437.65 693.09,437.86 707.89,437.76 722.70,436.87 737.51,426.68 752.32,432.16 767.12,432.59 781.93,432.60 796.74,432.63 811.54,432.64 826.35,424.51 841.16,424.63 855.96,424.68 870.77,424.70 885.58,424.74 900.39,424.75 915.19,424.75 930.00,424.76"/>
+<line x1="90.94" y1="90" x2="90.94" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="90.94" y1="85.00" x2="90.94" y2="90.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="94.94" y="82.00" text-anchor="start">#1 23m45s</text>
+<rect x="742" y="92" width="170" height="64" rx="6" fill="#ffffff" fill-opacity="0.92" stroke="#cbd5e1"/>
+<rect x="750" y="100" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="774" y="110">wired (GiB)</text>
+<rect x="750" y="118" width="12" height="12" fill="#16a34a"/>
+<text class="legend" x="774" y="128">file-backed (GiB)</text>
+<rect x="750" y="136" width="12" height="12" fill="#9333ea"/>
+<text class="legend" x="774" y="146">cmprssor (GiB)</text>
+<rect x="130.8" y="525" width="14" height="11" fill="#fef3c7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="148.8" y="535" text-anchor="start">prefill (Metal residency build)</text>
+<rect x="362.2" y="525" width="14" height="11" fill="#dbeafe" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="380.2" y="535" text-anchor="start">THINKING gen</text>
+<rect x="470.2" y="525" width="14" height="11" fill="#dcfce7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="488.2" y="535" text-anchor="start">answer gen</text>
+<rect x="565.2" y="525" width="14" height="11" fill="#fed7aa" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="583.2" y="535" text-anchor="start">thinking-checkpoint canonicalization</text>
+</svg>

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="572" viewBox="0 0 960 572">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 22px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 13px; font-weight: 600; fill: #334155; }
+.tick { font-size: 11px; fill: #64748b; }
+.legend { font-size: 12px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="572" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">dyn-highpower: DRAM bandwidth</text>
+<rect x="94.21" y="122" width="49.28" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="143.70" y="122" width="51.13" height="320" fill="#dbeafe" fill-opacity="0.55"/>
+<rect x="194.84" y="122" width="108.84" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="304.50" y="122" width="432.47" height="320" fill="#f3e8ff" fill-opacity="0.55"/>
+<rect x="736.97" y="122" width="4.11" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="741.44" y="122" width="24.28" height="320" fill="#f3e8ff" fill-opacity="0.55"/>
+<line x1="86" y1="442.00" x2="930" y2="442.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="446.00" text-anchor="end">0</text>
+<line x1="86" y1="375.33" x2="930" y2="375.33" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="379.33" text-anchor="end">25</text>
+<line x1="86" y1="308.67" x2="930" y2="308.67" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="312.67" text-anchor="end">50</text>
+<line x1="86" y1="242.00" x2="930" y2="242.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="246.00" text-anchor="end">75</text>
+<line x1="86" y1="175.33" x2="930" y2="175.33" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="179.33" text-anchor="end">100</text>
+<line x1="86.00" y1="122" x2="86.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="86.00" y="462" text-anchor="middle">0.0s</text>
+<line x1="291.35" y1="122" x2="291.35" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="291.35" y="462" text-anchor="middle">1m40s</text>
+<line x1="496.71" y1="122" x2="496.71" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="496.71" y="462" text-anchor="middle">3m20s</text>
+<line x1="702.06" y1="122" x2="702.06" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="702.06" y="462" text-anchor="middle">5m00s</text>
+<line x1="907.41" y1="122" x2="907.41" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="907.41" y="462" text-anchor="middle">6m40s</text>
+<line x1="86" y1="122" x2="86" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="86" y1="442" x2="930" y2="442" stroke="#334155" stroke-width="1.2"/>
+<text class="axis-label" x="480.0" y="554" text-anchor="middle">elapsed seconds (mactop epoch)</text>
+<text class="legend" x="86.00" y="472.00">#1 49s [title gen] prefill=552@23.2t/s gen=311@12.2t/s cache=0% stop | Generate a title for this conversation:</text>
+<text class="legend" x="86.00" y="488.00">#2 4m24s [agent→write] prefill=10664@201.7t/s gen=2302@10.9t/s cache=0% tool_calls | create minesweeper. 1 html file. file n…</text>
+<text class="legend" x="86.00" y="504.00">#3 14s [tool-result] prefill=12982 gen=95@8.1t/s cache=100% stop | Wrote file successfully.</text>
+<text class="axis-label" x="22" y="282.0" text-anchor="middle" transform="rotate(-90 22 282.0)">DRAM bandwidth (GB/s)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,411.72 106.54,409.68 116.80,405.56 129.12,332.74 139.39,308.80 149.66,312.29 161.98,298.88 172.25,309.93 182.52,323.15 194.84,329.32 205.10,344.57 217.43,354.27 227.69,371.11 237.96,360.59 250.28,324.28 260.55,335.51 272.87,339.20 283.14,389.99 295.46,346.66 305.73,344.16 316.00,334.61 328.32,325.63 338.58,327.10 350.91,316.81 361.17,311.76 371.44,315.49 383.76,306.05 394.03,308.93 406.35,301.52 416.62,311.72 426.89,314.80 439.21,316.78 449.47,309.06 461.80,322.71 472.06,316.13 484.38,312.78 494.65,316.87 504.92,315.50 517.24,317.18 527.51,317.46 539.83,312.51 550.10,311.51 560.36,311.79 572.69,316.68 582.95,314.07 595.27,314.32 605.54,316.58 615.81,323.32 628.13,314.99 638.40,316.36 650.72,312.76 660.99,328.18 671.26,323.14 683.58,316.09 693.84,325.19 706.17,329.57 716.43,356.12 726.70,354.00 739.02,338.64 749.29,435.76 761.61,442.00 771.88,442.00 784.20,442.00"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,411.72 106.54,409.68 116.80,405.56 129.12,332.74 139.39,308.80 149.66,312.29 161.98,298.88 172.25,309.93 182.52,323.15 194.84,329.32 205.10,344.57 217.43,354.27 227.69,371.11 237.96,360.59 250.28,324.28 260.55,335.51 272.87,339.20 283.14,389.99 295.46,346.66 305.73,344.16 316.00,334.61 328.32,325.63 338.58,327.10 350.91,316.81 361.17,311.76 371.44,315.49 383.76,306.05 394.03,308.93 406.35,301.52 416.62,311.72 426.89,314.80 439.21,316.78 449.47,309.06 461.80,322.71 472.06,316.13 484.38,312.78 494.65,316.87 504.92,315.50 517.24,317.18 527.51,317.46 539.83,312.51 550.10,311.51 560.36,311.79 572.69,316.68 582.95,314.07 595.27,314.32 605.54,316.58 615.81,323.32 628.13,314.99 638.40,316.36 650.72,312.76 660.99,328.18 671.26,323.14 683.58,316.09 693.84,325.19 706.17,329.57 716.43,356.12 726.70,354.00 739.02,338.64 749.29,435.76 761.61,442.00 771.88,442.00 784.20,442.00"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,381.44 106.54,377.36 116.80,369.11 129.12,223.48 139.39,175.59 149.66,182.58 161.98,155.76 172.25,177.86 182.52,204.30 194.84,216.65 205.10,247.15 217.43,266.55 227.69,300.21 237.96,279.17 250.28,206.56 260.55,229.03 272.87,236.39 283.14,337.99 295.46,251.31 305.73,246.32 316.00,227.22 328.32,209.27 338.58,212.20 350.91,191.63 361.17,181.51 371.44,188.99 383.76,170.10 394.03,175.86 406.35,161.04 416.62,181.44 426.89,187.61 439.21,191.55 449.47,176.13 461.80,203.42 472.06,190.26 484.38,183.55 494.65,191.74 504.92,189.00 517.24,192.37 527.51,192.91 539.83,183.02 550.10,181.02 560.36,181.59 572.69,191.36 582.95,186.15 595.27,186.65 605.54,191.16 615.81,204.65 628.13,187.97 638.40,190.73 650.72,183.53 660.99,214.36 671.26,204.29 683.58,190.18 693.84,208.39 706.17,217.15 716.43,270.25 726.70,266.00 739.02,235.28 749.29,429.52 761.61,442.00 771.88,442.00 784.20,442.00"/>
+<line x1="94.21" y1="122" x2="94.21" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="94.21" y1="101.00" x2="94.21" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="98.21" y="98.00" text-anchor="start">#1 49s [title gen]</text>
+<line x1="194.84" y1="122" x2="194.84" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="194.84" y1="117.00" x2="194.84" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="198.84" y="114.00" text-anchor="start">#2 4m24s [agent→write]</text>
+<line x1="736.97" y1="122" x2="736.97" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="736.97" y1="101.00" x2="736.97" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="740.97" y="98.00" text-anchor="start">#3 14s [tool-result]</text>
+<rect x="742" y="124" width="170" height="64" rx="6" fill="#ffffff" fill-opacity="0.92" stroke="#cbd5e1"/>
+<rect x="750" y="132" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="774" y="142">DRAM read GB/s</text>
+<rect x="750" y="150" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="774" y="160">DRAM write GB/s</text>
+<rect x="750" y="168" width="12" height="12" fill="#16a34a"/>
+<text class="legend" x="774" y="178">DRAM combined GB/s</text>
+<rect x="266.0" y="557" width="14" height="11" fill="#fef3c7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="284.0" y="567" text-anchor="start">prefill (Metal residency build)</text>
+<rect x="497.5" y="557" width="14" height="11" fill="#dbeafe" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="515.5" y="567" text-anchor="start">THINKING gen</text>
+<rect x="605.5" y="557" width="14" height="11" fill="#f3e8ff" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="623.5" y="567" text-anchor="start">TOOLS gen</text>
+</svg>

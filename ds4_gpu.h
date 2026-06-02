@@ -2,6 +2,7 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* =========================================================================
@@ -41,7 +42,39 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+/* Prefetch helpers defined in ds4.c, exposed so the Metal TU can issue real
+ * async reads (F_RDADVISE) on the routed-metal-dynamic warm path instead of a
+ * Darwin no-op madvise(WILLNEED) hint.  ds4_rdadvise_range is a no-op on
+ * non-Apple builds; ds4_prefetch_rdadvise_enabled() reflects
+ * DS4_PREFETCH_USE_RDADVISE. */
+void ds4_rdadvise_range(int fd, const void *map_base, const void *p, size_t len);
+int  ds4_prefetch_rdadvise_enabled(void);
+void ds4_prefetch_rdadvise_stats(uint64_t *calls, uint64_t *enotty, uint64_t *dropped);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+/* Add views for a second model (e.g. the MTP draft GGUF) without dropping
+ * existing views.  Use this when a second mmap must coexist with the base
+ * model's views across subsequent base remappings (phase swap, gen restore). */
+int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size,
+                                 const uint64_t *map_offsets, const uint64_t *map_sizes,
+                                 uint32_t n_ranges);
+/* Like set_model_map_ranges, but keep any existing view whose file
+ * byte range is fully covered by one of the new ranges.  Used for
+ * --prefill-metal-phases swaps so MTLBuffers covering ranges that
+ * appear in both phases (head/tail and, for --n-cpu-moe N<DS4_N_LAYER,
+ * the always_metal layer routed-expert block) survive instead of
+ * being dropped and re-mapped.  Gen-time mapping always uses the
+ * non-keep variant for a clean residency set. */
+int ds4_gpu_set_model_map_ranges_keep_existing(
+        const void *model_map, uint64_t model_size,
+        const uint64_t *map_offsets, const uint64_t *map_sizes,
+        uint32_t n_ranges);
+/* Set a one-shot flag that suppresses the warmup touch-loop in the NEXT
+ * call to a residency-establishing API.  Used by --prefill-metal-phases
+ * so phase swaps avoid the 20-30s synchronous page-touch pass; the
+ * initial residency at engine_open and any explicit user warmup still
+ * pay the page-in cost.  Returns the previous flag value. */
+int ds4_gpu_set_skip_next_warmup(int skip);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
@@ -662,6 +695,51 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x);
+
+/* Experimental --routed-metal-dynamic gen-time path.  Same as
+ * ds4_gpu_routed_moe_one_tensor but, instead of wrapping the whole expert
+ * tensor (all n_total_expert experts), it wires only the router-selected
+ * experts (selected_ids[0..n_expert)) through the dynamic LRU residency
+ * manager and dispatches per-expert.  `selected_ids` must be the CPU-side
+ * copy of the `selected` GPU tensor (read after the router select flushes).
+ * Returns 0 on any unsupported case (quant type, residency failure) so the
+ * caller can fall back to the CPU MoE path. */
+int ds4_gpu_routed_moe_one_tensor_dynamic(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const int32_t          *selected_ids,
+        uint32_t                layer);
+
+/* Print LRU residency stats (hit rate, wired bytes, evictions) for the
+ * --routed-metal-dynamic path.  No-op when the path was never used. */
+void ds4_gpu_routed_dyn_stats_dump(void);
+
+/* Release all dynamic routed-expert residency: unwire the residency set and
+ * drop every per-expert buffer.  Safe to call when the path was never used. */
+void ds4_gpu_routed_dyn_clear(void);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

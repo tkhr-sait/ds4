@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 22px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 13px; font-weight: 600; fill: #334155; }
+.tick { font-size: 11px; fill: #64748b; }
+.legend { font-size: 12px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">chat: disk I/O (iostat 30s)</text>
+<rect x="90.38" y="90" width="23.20" height="352" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="113.72" y="90" width="162.72" height="352" fill="#dbeafe" fill-opacity="0.55"/>
+<rect x="276.43" y="90" width="404.51" height="352" fill="#dcfce7" fill-opacity="0.55"/>
+<rect x="680.94" y="90" width="33.27" height="352" fill="#fed7aa" fill-opacity="0.55"/>
+<line x1="86" y1="442.00" x2="874" y2="442.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="446.00" text-anchor="end">0</text>
+<line x1="86" y1="354.00" x2="874" y2="354.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="358.00" text-anchor="end">1k</text>
+<line x1="86" y1="266.00" x2="874" y2="266.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="270.00" text-anchor="end">2k</text>
+<line x1="86" y1="178.00" x2="874" y2="178.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="182.00" text-anchor="end">3k</text>
+<line x1="86" y1="90.00" x2="874" y2="90.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="94.00" text-anchor="end">4k</text>
+<text class="tick" x="884" y="446.00" text-anchor="start">0</text>
+<text class="tick" x="884" y="328.67" text-anchor="start">10k</text>
+<text class="tick" x="884" y="211.33" text-anchor="start">20k</text>
+<text class="tick" x="884" y="94.00" text-anchor="start">30k</text>
+<line x1="86.00" y1="90" x2="86.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="86.00" y="462" text-anchor="middle">0.0s</text>
+<line x1="304.89" y1="90" x2="304.89" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="304.89" y="462" text-anchor="middle">8m20s</text>
+<line x1="523.78" y1="90" x2="523.78" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="523.78" y="462" text-anchor="middle">16m40s</text>
+<line x1="742.67" y1="90" x2="742.67" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="742.67" y="462" text-anchor="middle">25m00s</text>
+<line x1="86" y1="90" x2="86" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="86" y1="442" x2="874" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="874" y1="90" x2="874" y2="442" stroke="#334155" stroke-width="1.2"/>
+<text class="axis-label" x="480.0" y="522" text-anchor="middle">elapsed seconds (approx. aligned to ds4-server epoch)</text>
+<text class="legend" x="86.00" y="472.00">#1 23m45s prefill=54s gen=8714@6.7t/s stop</text>
+<text class="axis-label" x="22" y="266.0" text-anchor="middle" transform="rotate(-90 22 266.0)">disk MB/s</text>
+<text class="axis-label" x="938" y="266.0" text-anchor="middle" transform="rotate(90 938 266.0)">disk tps</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="86.00,430.11 99.13,381.83 112.27,178.29 125.40,255.59 138.53,398.74 151.67,405.30 164.80,412.36 177.93,420.09 191.07,423.95 204.20,421.71 217.33,422.62 230.47,422.64 243.60,416.41 256.73,419.31 269.87,420.16 283.00,421.69 296.13,411.79 309.27,413.45 322.40,419.20 335.53,423.47 348.67,424.53 361.80,427.59 374.93,425.17 388.07,425.36 401.20,424.14 414.33,425.72 427.47,426.63 440.60,427.83 453.73,422.64 466.87,421.78 480.00,423.04 493.13,420.58 506.27,415.79 519.40,423.04 532.53,421.13 545.67,419.53 558.80,421.74 571.93,421.85 585.07,424.99 598.20,421.49 611.33,422.92 624.47,420.98 637.60,424.74 650.73,419.35 663.87,412.02 677.00,412.37 690.13,408.24 703.27,364.00 716.40,254.77 729.53,441.72 742.67,441.95 755.80,441.83 768.93,441.97 782.07,439.86 795.20,437.51 808.33,441.90 821.47,441.87 834.60,441.25 847.73,441.96 860.87,441.94 874.00,441.99"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="86.00,398.82 99.13,425.28 112.27,370.49 125.40,242.85 138.53,159.71 151.67,200.26 164.80,247.06 177.93,296.68 191.07,323.59 204.20,307.17 217.33,312.30 230.47,313.73 243.60,273.38 256.73,291.05 269.87,298.40 283.00,308.42 296.13,242.31 309.27,254.79 322.40,293.53 335.53,321.58 348.67,329.67 361.80,349.32 374.93,331.74 388.07,331.45 401.20,323.35 414.33,333.03 427.47,341.39 440.60,347.89 453.73,313.58 466.87,308.10 480.00,316.62 493.13,299.30 506.27,268.18 519.40,316.54 532.53,302.74 545.67,293.07 558.80,306.89 571.93,308.85 585.07,329.74 598.20,306.66 611.33,315.29 624.47,302.13 637.60,328.12 650.73,291.30 663.87,235.79 677.00,240.02 690.13,284.40 703.27,392.38 716.40,384.47 729.53,440.26 742.67,441.51 755.80,440.81 768.93,441.86 782.07,428.31 795.20,423.46 808.33,441.53 821.47,440.78 834.60,439.16 847.73,441.66 860.87,441.37 874.00,441.94"/>
+<line x1="90.38" y1="90" x2="90.38" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="90.38" y1="85.00" x2="90.38" y2="90.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="94.38" y="82.00" text-anchor="start">#1 23m45s</text>
+<rect x="636" y="92" width="170" height="46" rx="6" fill="#ffffff" fill-opacity="0.92" stroke="#cbd5e1"/>
+<rect x="644" y="100" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="668" y="110">disk0 MB/s</text>
+<line x1="644" y1="124" x2="662" y2="124" stroke="#dc2626" stroke-width="2" stroke-dasharray="6 3"/>
+<text class="legend" x="668" y="128">disk0 tps</text>
+<rect x="130.8" y="525" width="14" height="11" fill="#fef3c7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="148.8" y="535" text-anchor="start">prefill (Metal residency build)</text>
+<rect x="362.2" y="525" width="14" height="11" fill="#dbeafe" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="380.2" y="535" text-anchor="start">THINKING gen</text>
+<rect x="470.2" y="525" width="14" height="11" fill="#dcfce7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="488.2" y="535" text-anchor="start">answer gen</text>
+<rect x="565.2" y="525" width="14" height="11" fill="#fed7aa" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="583.2" y="535" text-anchor="start">thinking-checkpoint canonicalization</text>
+</svg>

@@ -114,6 +114,50 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --cpu-moe\n"
+        "      Compute routed MoE experts on the CPU; routed expert weights stay\n"
+        "      in the OS page cache instead of Metal residency. Lets models that\n"
+        "      exceed the Metal wired-memory cap run, at the cost of CPU-bound\n"
+        "      generation. Used alone, prefill is also CPU-bound and slow; combine\n"
+        "      with --prefill-metal-phases to recover prefill throughput. Metal\n"
+        "      backend only. Equivalent to --n-cpu-moe with all layers on CPU.\n"
+        "  --n-cpu-moe N\n"
+        "      Compute the routed MoE on the CPU only for the first N layers; the\n"
+        "      remaining DS4_N_LAYER-N layers stay on Metal. Matches llama.cpp's\n"
+        "      --n-cpu-moe semantics. Smaller N keeps more layers on Metal (faster\n"
+        "      gen, larger Metal residency); larger N reduces Metal footprint at\n"
+        "      the cost of CPU-bound gen for those layers. The optimal N depends\n"
+        "      on model size, context length, and the iogpu.wired_limit_mb cap;\n"
+        "      no single sweet spot. N=0 disables CPU MoE entirely.\n"
+        "  --prefill-metal-phases auto|N\n"
+        "      Run prefill on Metal in N evenly-split phases, swapping the routed\n"
+        "      expert residency between phases. Without --n-cpu-moe, generation\n"
+        "      falls back to cpu-moe for every layer. Combined with --n-cpu-moe M\n"
+        "      (M < DS4_N_LAYER), only layers [0..M) cycle across phases; layers\n"
+        "      [M..DS4_N_LAYER) stay Metal-resident across every phase and during\n"
+        "      gen, keeping their expert tensors wired. N=1 is a valid single-\n"
+        "      phase configuration: prefill loads all routed experts onto Metal\n"
+        "      as one phase (full model resident); gen restores the cpu-moe\n"
+        "      routing so routed experts are read from the OS page cache.\n"
+        "      \"auto\" sizes N from sysctl iogpu.wired_limit_mb (bounded by\n"
+        "      hw.memsize) so each phase fits the Metal wired-memory cap.\n"
+        "      Metal backend only.\n"
+        "      Env overrides: DS4_PREFILL_METAL_PHASES_WIRED_LIMIT_MIB,\n"
+        "      DS4_PREFILL_METAL_PHASES_HEADROOM_MIB (default 14336),\n"
+        "      DS4_PREFILL_METAL_PHASES_MIN_TOKENS (default 300; compared\n"
+        "      against the prefill range length -- the full prompt on a cold\n"
+        "      start or the suffix when resuming an existing checkpoint --\n"
+        "      and falls back to cpu-moe prefill when shorter).\n"
+        "  --routed-metal-dynamic\n"
+        "      Experimental. Compute gen-time routed MoE experts on Metal by\n"
+        "      dynamically wiring only the router-selected experts into a\n"
+        "      dedicated residency set, backed by an LRU working-set cache\n"
+        "      bounded by a wired budget. Unlike the always-Metal path it\n"
+        "      never pins all experts of a layer; unlike --cpu-moe it runs the\n"
+        "      GEMV on the GPU. Applies to the cpu-moe layers (requires\n"
+        "      --cpu-moe or --n-cpu-moe). Metal backend only. Default off;\n"
+        "      falls back to the CPU path on unsupported quant types.\n"
+        "      Env override: DS4_ROUTED_METAL_BUDGET_MIB (default 40960).\n"
         "  --power N\n"
         "      Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "\n"
@@ -1494,6 +1538,19 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--cpu-moe")) {
+            c.engine.cpu_moe = true;
+        } else if (!strcmp(arg, "--n-cpu-moe")) {
+            c.engine.n_cpu_moe_layers = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-metal-phases")) {
+            const char *s = need_arg(&i, argc, argv, arg);
+            if (!strcmp(s, "auto")) {
+                c.engine.prefill_metal_phases = -1;
+            } else {
+                c.engine.prefill_metal_phases = parse_int(s, arg);
+            }
+        } else if (!strcmp(arg, "--routed-metal-dynamic")) {
+            c.engine.routed_metal_dynamic = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

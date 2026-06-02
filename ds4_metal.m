@@ -11,6 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <sys/mman.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -132,6 +136,7 @@ static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
+static int g_model_fd = -1;   /* model file fd for F_RDADVISE warm (set via ds4_gpu_set_model_fd) */
 static uint64_t g_model_mapped_offset;
 static uint64_t g_model_mapped_size;
 static uint64_t g_model_mapped_max_tensor_bytes;
@@ -195,7 +200,13 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
+/*
+ * --cpu-moe lets a ~150 GiB Q4 GGUF load on a
+ * 128 GiB Mac (routed experts stay in the page cache), and covering the full
+ * file with mmap views at that machine's modest maxBufferLength needs far
+ * more windows than the 2-bit model ever did.
+ */
+#define DS4_METAL_MAX_MODEL_VIEWS 256
 /* Compatibility fallback for callers that cannot provide a parsed GGUF tensor
  * span. The normal DS4 engine passes the exact maximum tensor byte size. */
 #define DS4_METAL_FALLBACK_MAX_TENSOR_BYTES (4ull * 1024ull * 1024ull * 1024ull)
@@ -367,7 +378,124 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 static int ds4_gpu_warm_model_views(void);
+static double ds4_gpu_now_ms(void);
+static void ds4_gpu_progress_begin(const char *what);
+static void ds4_gpu_progress_done(void);
+static void ds4_gpu_progress_failed(void);
+static int ds4_gpu_model_residency_request_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
+
+static int ds4_gpu_model_views_cover_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    map_offset,
+        uint64_t    map_size) {
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        if (g_model_views[i].model_map == model_map &&
+            g_model_views[i].model_size == model_size &&
+            map_offset >= g_model_views[i].model_offset &&
+            map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One-shot flag set by ds4_gpu_set_skip_next_warmup().  Cleared
+ * unconditionally inside ds4_gpu_finalize_model_views() so subsequent
+ * calls warmup normally unless re-armed. */
+static int g_skip_next_warmup = 0;
+
+int ds4_gpu_set_skip_next_warmup(int skip) {
+    const int prev = g_skip_next_warmup;
+    g_skip_next_warmup = skip ? 1 : 0;
+    return prev;
+}
+
+/* G2: measure each phase of the residency setup so finalize_model_views can
+ * tell us how much of "Metal residency requested in X ms" is descriptor
+ * setup vs commit vs the blocking page-in.  ~all of X is normally the
+ * requestResidency wait (SSD->UBC page-in for the routed-expert ranges). */
+static double g_last_residency_setup_ms   = 0.0;  /* descriptor + addAllocation loop */
+static double g_last_residency_commit_ms  = 0.0;  /* [residency commit] */
+static double g_last_residency_request_ms = 0.0;  /* [residency requestResidency] blocking */
+
+/* DS4_ROUTED_DYN_DEBUG=1: print OS-level memory at residency transitions.
+ * The g_routed_dyn.wired_bytes counter is software-only (sum of entry byte
+ * sizes) and blind to OS eviction -- it stays at the budget (e.g. 80 GiB) even
+ * after macOS has reclaimed those wired-but-unreferenced pages under file-
+ * backed prefill pressure.  This probe reads the REAL wired/compressed/file-
+ * backed page counts via mach host_statistics64 so we can see, with no
+ * guessing, exactly when the routed-dyn working set leaves residency (gradual
+ * decline across phase swaps = OS reclaim during prefill; sharp drop at the
+ * main-set endResidency = restore cascade) and how much the first gen commit
+ * re-faults. Counts are in host_page_size units (16 KiB on Apple Silicon),
+ * matching the vm_stat CLI. No behaviour change; pure read-only diagnostics. */
+static void ds4_dbg_vm(const char *tag) {
+#if defined(__APPLE__)
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROUTED_DYN_DEBUG");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    if (!cached) return;
+    const mach_port_t host = mach_host_self();
+    vm_size_t page = 0;
+    if (host_page_size(host, &page) != KERN_SUCCESS || page == 0) page = 16384;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    const kern_return_t kr = host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &cnt);
+    mach_port_deallocate(mach_task_self(), host);   /* mach_host_self() send right */
+    if (kr != KERN_SUCCESS) return;
+    const double g = 1024.0 * 1024.0 * 1024.0;
+    fprintf(stderr,
+            "ds4: [routed_dyn_dbg] vm@%-22s wired=%.2f compressed=%.2f "
+            "file-backed=%.2f free=%.2f GiB\n",
+            tag,
+            (double)vm.wire_count            * (double)page / g,
+            (double)vm.compressor_page_count * (double)page / g,
+            (double)vm.external_page_count   * (double)page / g,
+            (double)vm.free_count            * (double)page / g);
+#else
+    (void)tag;
+#endif
+}
+
+static int ds4_gpu_finalize_model_views(void) {
+    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    const double t0 = ds4_gpu_now_ms();
+    if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
+    if (!ds4_gpu_model_residency_request_views()) {
+        if (request_residency) ds4_gpu_progress_failed();
+        g_skip_next_warmup = 0;
+        return 0;
+    }
+    if (request_residency) ds4_gpu_progress_done();
+    const double t_resident = ds4_gpu_now_ms();
+
+    int warmed = 1;
+    const int skip_once = g_skip_next_warmup;
+    g_skip_next_warmup = 0;
+    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL &&
+                                 !skip_once;
+    if (warm_model_views) {
+        ds4_gpu_progress_begin("warming Metal model views");
+        warmed = ds4_gpu_warm_model_views();
+        if (warmed) ds4_gpu_progress_done();
+        else ds4_gpu_progress_failed();
+    }
+    const double t_warm = ds4_gpu_now_ms();
+    fprintf(stderr,
+            "ds4: Metal residency requested in %.3f ms "
+            "(setup=%.3f ms commit=%.3f ms requestResidency=%.3f ms), warmup %.3f ms\n",
+            t_resident - t0,
+            g_last_residency_setup_ms,
+            g_last_residency_commit_ms,
+            g_last_residency_request_ms,
+            t_warm - t_resident);
+    return warmed;
+}
 
 static double ds4_gpu_now_ms(void) {
     struct timespec ts;
@@ -408,13 +536,45 @@ static void ds4_gpu_model_views_clear(void) {
     g_model_view_count = 0;
 }
 
+/* Drop views belonging to (target_model_map, target_model_size); keep views
+ * belonging to other models so a second mmap (e.g. the MTP draft GGUF) can
+ * coexist with the base model's views when set_model_map_range remaps the
+ * base.  Pass NULL to drop all views unconditionally. */
+static void ds4_gpu_model_views_clear_for_map(const void *target_model_map,
+                                              uint64_t    target_model_size) {
+    uint32_t write_idx = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        const int drop = (target_model_map == NULL) ||
+                         (g_model_views[i].model_map == target_model_map &&
+                          g_model_views[i].model_size == target_model_size);
+        if (!drop) {
+            if (write_idx != i) {
+                g_model_views[write_idx] = g_model_views[i];
+            }
+            write_idx++;
+        } else {
+            g_model_views[i].buffer = nil;
+        }
+    }
+    for (uint32_t i = write_idx; i < g_model_view_count; i++) {
+        g_model_views[i].buffer = nil;
+        g_model_views[i].model_map = NULL;
+        g_model_views[i].model_size = 0;
+        g_model_views[i].model_offset = 0;
+        g_model_views[i].bytes = 0;
+    }
+    g_model_view_count = write_idx;
+}
+
 static void ds4_gpu_model_residency_clear(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
         if (g_model_residency_set) {
+            ds4_dbg_vm("main_resclear_pre");
             [g_model_residency_set endResidency];
             [g_model_residency_set removeAllAllocations];
             g_model_residency_set = nil;
+            ds4_dbg_vm("main_resclear_post");
         }
     }
 #endif
@@ -434,6 +594,7 @@ static int ds4_gpu_model_residency_request_views(void) {
          * discovering them lazily from the first measured graph command, where
          * VM validation and residency accounting would look like model compute.
          */
+        const double t_setup0 = ds4_gpu_now_ms();
         MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
         desc.label = @"ds4_model";
         desc.initialCapacity = g_model_view_count;
@@ -449,8 +610,15 @@ static int ds4_gpu_model_residency_request_views(void) {
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             [g_model_residency_set addAllocation:g_model_views[i].buffer];
         }
+        const double t_commit0 = ds4_gpu_now_ms();
         [g_model_residency_set commit];
+        const double t_request0 = ds4_gpu_now_ms();
         [g_model_residency_set requestResidency];
+        const double t_request1 = ds4_gpu_now_ms();
+        ds4_dbg_vm("main_request_post");
+        g_last_residency_setup_ms   = t_commit0  - t_setup0;
+        g_last_residency_commit_ms  = t_request0 - t_commit0;
+        g_last_residency_request_ms = t_request1 - t_request0;
         g_model_residency_count = g_model_view_count;
     }
 #endif
@@ -567,42 +735,11 @@ static int ds4_gpu_map_model_views(
     }
 
     const double t_mapped = ds4_gpu_now_ms();
-    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
-    if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
-    if (!ds4_gpu_model_residency_request_views()) {
-        if (request_residency) ds4_gpu_progress_failed();
-        return 0;
-    }
-    if (request_residency) ds4_gpu_progress_done();
-    const double t_resident = ds4_gpu_now_ms();
-    int warmed = 1;
-    const double t_warm0 = ds4_gpu_now_ms();
-    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
-    if (warm_model_views) {
-        /*
-         * The first GPU command touching no-copy mmap storage can pay command
-         * queue setup, page-table validation, and shared-allocation residency
-         * costs. Sample each model view here so timed graph execution starts
-         * after that one-time work. The stride is intentionally coarse: this is
-         * a validation touch over the VM ranges, not a full model prefetch. A
-         * dense prefetch would create exactly the kind of memory pressure and
-         * startup stalls this path is designed to avoid.
-         */
-        ds4_gpu_progress_begin("warming Metal model views");
-        warmed = ds4_gpu_warm_model_views();
-        if (warmed) ds4_gpu_progress_done();
-        else ds4_gpu_progress_failed();
-    }
-    const double t_warm = ds4_gpu_now_ms();
     fprintf(stderr,
-            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            "ds4: Metal model views created in %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
             t_mapped - t0,
-            t_resident - t_mapped,
-            t_warm - t_warm0,
             mapped_model_size / 1024.0 / 1024.0,
             page_model_offset / 1024.0 / 1024.0);
-    if (!warmed) return 0;
     return 1;
 }
 
@@ -4879,28 +5016,255 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
             return 1;
         }
 
-        for (uint32_t i = 0; i < g_model_view_count; i++) {
-            if (g_model_views[i].model_map == model_map &&
-                g_model_views[i].model_size == model_size &&
-                map_offset >= g_model_views[i].model_offset &&
-                map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
-                return 1;
-            }
-        }
-
+        /* Drain any in-flight command buffer that may still reference old
+         * model views before we release them. Without this, releasing the
+         * old MTLBuffer would be deferred until the command buffer drops
+         * its reference, leaving us with the old views and the new views
+         * overlapping the same mmap range — exactly the accumulation that
+         * pushed cpt_mapcnt past 2048 on the 145 GiB GGUF and panicked the
+         * kernel. */
+        (void)ds4_gpu_wait_pending_command_buffers("set_model_map_range");
         ds4_gpu_model_residency_clear();
-        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, max_tensor_bytes)) {
-            ds4_gpu_model_residency_clear();
-            return 0;
-        }
+        ds4_gpu_model_views_clear_for_map(model_map, model_size);
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
         g_model_mapped_offset = map_offset;
         g_model_mapped_size = map_size;
         g_model_mapped_max_tensor_bytes = max_tensor_bytes;
+        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, max_tensor_bytes)) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
+        if (!ds4_gpu_finalize_model_views()) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
         fprintf(stderr,
                 "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
                 g_model_view_count);
+        return 1;
+    }
+}
+
+/* Add views for a second model (e.g. the MTP draft GGUF) without disturbing
+ * any existing views.  Unlike set_model_map_range, this never calls
+ * model_views_clear / residency_clear, so coexisting mmaps survive across
+ * subsequent base-model remappings driven by phase swap or gen restore. */
+int ds4_gpu_add_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0) return 0;
+    if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
+
+    @autoreleasepool {
+        (void)ds4_gpu_wait_pending_command_buffers("add_model_map_range");
+        if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
+            !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, 0)) {
+            return 0;
+        }
+        if (!ds4_gpu_finalize_model_views()) {
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Metal added model views (now %u overlapping shared buffers)\n",
+                g_model_view_count);
+        return 1;
+    }
+}
+
+int ds4_gpu_set_model_map_ranges(
+        const void *model_map,
+        uint64_t    model_size,
+        const uint64_t *map_offsets,
+        const uint64_t *map_sizes,
+        uint32_t    n_ranges) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || !map_offsets || !map_sizes || n_ranges == 0) return 0;
+
+    @autoreleasepool {
+        /* Same rationale as set_model_map_range: drain in-flight command
+         * buffers and drop the old MTLBuffer views before remapping so we
+         * never have two generations of overlapping views referencing the
+         * same mmap range at once. */
+        (void)ds4_gpu_wait_pending_command_buffers("set_model_map_ranges");
+        ds4_gpu_model_residency_clear();
+        ds4_gpu_model_views_clear_for_map(model_map, model_size);
+        g_model_map_ptr = model_map;
+        g_model_map_size = model_size;
+
+        uint64_t lo = UINT64_MAX;
+        uint64_t hi = 0;
+        for (uint32_t i = 0; i < n_ranges; i++) {
+            const uint64_t map_offset = map_offsets[i];
+            const uint64_t map_size = map_sizes[i];
+            if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) {
+                return 0;
+            }
+            if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
+                !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, 0)) {
+                ds4_gpu_model_residency_clear();
+                return 0;
+            }
+            if (map_offset < lo) lo = map_offset;
+            if (map_offset + map_size > hi) hi = map_offset + map_size;
+        }
+
+        g_model_mapped_offset = lo == UINT64_MAX ? 0 : lo;
+        g_model_mapped_size = lo == UINT64_MAX ? 0 : hi - lo;
+        if (!ds4_gpu_finalize_model_views()) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
+                g_model_view_count);
+        return 1;
+    }
+}
+
+int ds4_gpu_set_model_map_ranges_keep_existing(
+        const void *model_map,
+        uint64_t    model_size,
+        const uint64_t *map_offsets,
+        const uint64_t *map_sizes,
+        uint32_t    n_ranges) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || !map_offsets || !map_sizes || n_ranges == 0) return 0;
+
+    @autoreleasepool {
+        (void)ds4_gpu_wait_pending_command_buffers("set_model_map_ranges_keep");
+
+        /* Step 1: classify existing views as keep or drop.  A view is
+         * kept iff it lies fully inside at least one of the new
+         * ranges.  Keep views' MTLBuffers stay live, so the page-level
+         * residency macOS gave them survives this call.  Dropped
+         * views' MTLBuffers are released and removed from the
+         * residency set.  Note: view.bytes is page-rounded up by
+         * map_model_views, so compare against a page-aligned range end
+         * to avoid spurious drops at the tail of mapping. */
+        const uint64_t page = (uint64_t)getpagesize();
+        uint32_t write_idx = 0;
+        uint32_t dropped = 0;
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            bool keep = false;
+            bool map_ok = (g_model_views[i].model_map == model_map &&
+                           g_model_views[i].model_size == model_size);
+            if (!map_ok) {
+                /* View belongs to a different model (e.g. the MTP draft
+                 * GGUF mapped via ds4_gpu_add_model_map_range).  This call
+                 * only remaps the base model's ranges, so views from other
+                 * mmaps must survive unconditionally. */
+                keep = true;
+            } else {
+                const uint64_t v_start = g_model_views[i].model_offset;
+                const uint64_t v_end   = v_start + g_model_views[i].bytes;
+                for (uint32_t r = 0; r < n_ranges; r++) {
+                    /* view.model_offset is page-rounded down by
+                     * map_model_views (page_model_offset = map_offset &
+                     * ~(page-1)).  Compare against a page-rounded-down
+                     * range start so a kept view that begins one
+                     * sub-page before the raw map_offset still
+                     * matches. */
+                    const uint64_t r_start_raw = map_offsets[r];
+                    const uint64_t r_start = r_start_raw & ~(page - 1);
+                    const uint64_t r_end_raw = r_start_raw + map_sizes[r];
+                    const uint64_t r_end = (r_end_raw + page - 1) & ~(page - 1);
+                    if (v_start >= r_start && v_end <= r_end) {
+                        keep = true;
+                        break;
+                    }
+                }
+            }
+            if (keep) {
+                if (write_idx != i) {
+                    g_model_views[write_idx] = g_model_views[i];
+                }
+                write_idx++;
+            } else {
+#if TARGET_OS_OSX
+                if (@available(macOS 15.0, *)) {
+                    if (g_model_residency_set && g_model_views[i].buffer) {
+                        [g_model_residency_set removeAllocation:g_model_views[i].buffer];
+                    }
+                }
+#endif
+                g_model_views[i].buffer = nil;
+                dropped++;
+            }
+        }
+        for (uint32_t i = write_idx; i < g_model_view_count; i++) {
+            g_model_views[i].buffer = nil;
+            g_model_views[i].model_map = NULL;
+            g_model_views[i].model_size = 0;
+            g_model_views[i].model_offset = 0;
+            g_model_views[i].bytes = 0;
+        }
+        const uint32_t kept = write_idx;
+        g_model_view_count = write_idx;
+
+        g_model_map_ptr = model_map;
+        g_model_map_size = model_size;
+
+        /* Step 2: cover each new range either with an existing kept
+         * view (no-op) or by mapping a new MTLBuffer. */
+        uint64_t lo = UINT64_MAX;
+        uint64_t hi = 0;
+        for (uint32_t i = 0; i < n_ranges; i++) {
+            const uint64_t map_offset = map_offsets[i];
+            const uint64_t map_size = map_sizes[i];
+            if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) {
+                return 0;
+            }
+            if (!ds4_gpu_model_views_cover_range(model_map, model_size, map_offset, map_size) &&
+                !ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size, 0)) {
+                ds4_gpu_model_residency_clear();
+                return 0;
+            }
+            if (map_offset < lo) lo = map_offset;
+            if (map_offset + map_size > hi) hi = map_offset + map_size;
+        }
+        const uint32_t added = g_model_view_count - kept;
+
+        g_model_mapped_offset = lo == UINT64_MAX ? 0 : lo;
+        g_model_mapped_size = lo == UINT64_MAX ? 0 : hi - lo;
+
+        /* Step 3: incorporate newly added views into the residency set.
+         * If no residency set exists yet (first call after init), fall
+         * back to the standard rebuild path. */
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            if (g_model_residency_set) {
+                for (uint32_t i = kept; i < g_model_view_count; i++) {
+                    [g_model_residency_set addAllocation:g_model_views[i].buffer];
+                }
+                [g_model_residency_set commit];
+                [g_model_residency_set requestResidency];
+                ds4_dbg_vm("phase_request_post");
+                g_model_residency_count = g_model_view_count;
+            } else {
+                if (!ds4_gpu_model_residency_request_views()) {
+                    return 0;
+                }
+            }
+        } else {
+            if (!ds4_gpu_model_residency_request_views()) {
+                return 0;
+            }
+        }
+#else
+        if (!ds4_gpu_model_residency_request_views()) {
+            return 0;
+        }
+#endif
+
+        /* Kept views' pages stay wired through the existing Metal
+         * kernel reads; newly added views are on-demand page-faulted
+         * on first dereference.  Skip the touch loop. */
+        g_skip_next_warmup = 1;
+
+        fprintf(stderr,
+                "ds4: Metal mapped mmaped model as %u overlapping shared buffers "
+                "(keep_existing: kept=%u dropped=%u added=%u)\n",
+                g_model_view_count, kept, dropped, added);
         return 1;
     }
 }
@@ -4910,7 +5274,7 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 }
 
 int ds4_gpu_set_model_fd(int fd) {
-    (void)fd;
+    g_model_fd = fd;
     return 1;
 }
 
@@ -13875,6 +14239,600 @@ int ds4_gpu_router_select_batch_tensor(
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
         if (!ok) return 0;
+    }
+
+    return 1;
+}
+
+/* ===================================================================
+ * Experimental --routed-metal-dynamic: gen-time dynamic LRU residency
+ * for routed experts.
+ *
+ * Unlike ds4_gpu_routed_moe_one_tensor (which wraps the FULL expert tensor
+ * so any of the n_total_expert experts can wire), this path wires ONLY the
+ * router-selected experts' per-expert weight ranges into per-expert noCopy
+ * MTLBuffers, keeps a working set of recently-used (layer,expert) entries
+ * resident in a dedicated MTLResidencySet, and evicts the LRU tail once the
+ * wired byte total exceeds a budget (env DS4_ROUTED_METAL_BUDGET_MIB,
+ * default 40 GiB).  Token-to-token expert reuse keeps the hit rate high so
+ * most steps wire nothing.
+ *
+ * The compute kernels are reused verbatim: each selected expert is
+ * dispatched as a single-slot (nei0=1) mul_mv_id with nb02 forced to 0, so
+ * the per-expert buffer's base IS the expert and the kernel's i02*nb02
+ * offset collapses to zero.  Gate/up/down outputs are written per slot,
+ * then the existing swiglu-weight and sum-experts encoders combine them.
+ *
+ * macOS 15+ provides MTLResidencySet for explicit wire/unwire.  When it is
+ * unavailable the path still works (per-expert buffers + Metal's automatic
+ * residency + release-on-evict bounds the live set) but cannot pre-wire.
+ * =================================================================== */
+
+#define DS4_ROUTED_DYN_MAX_ENTRIES 16384u
+#define DS4_ROUTED_DYN_HASH_SIZE   16384u   /* power of two */
+
+typedef struct {
+    uint32_t layer;
+    uint32_t expert;
+    uint8_t  in_use;
+    __strong id<MTLBuffer> gate;
+    __strong id<MTLBuffer> up;
+    __strong id<MTLBuffer> down;
+    uint64_t gate_inner;
+    uint64_t up_inner;
+    uint64_t down_inner;
+    uint64_t bytes;            /* sum of the three page-rounded buffer lengths */
+    int32_t  lru_prev;         /* entry index, -1 = none (also free-list link) */
+    int32_t  lru_next;
+    int32_t  hash_next;        /* entry index, -1 = none */
+} ds4_routed_dyn_entry;
+
+static ds4_routed_dyn_entry g_routed_dyn_entries[DS4_ROUTED_DYN_MAX_ENTRIES];
+static int32_t g_routed_dyn_hash[DS4_ROUTED_DYN_HASH_SIZE];
+static id      g_routed_dyn_residency_set = nil;   /* id<MTLResidencySet>, macOS 15+ */
+
+static struct {
+    int      initialized;
+    int      have_set;             /* residency set available + created */
+    int32_t  lru_head;             /* MRU, -1 = empty */
+    int32_t  lru_tail;             /* LRU */
+    int32_t  free_head;            /* free-list head, -1 = empty */
+    uint64_t wired_bytes;
+    uint64_t budget_bytes;
+    uint64_t wired_peak;
+    uint32_t live_count;
+    int      dirty;                /* residency membership changed since last commit */
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evicts;
+    uint64_t requests;             /* commit+requestResidency calls */
+} g_routed_dyn;
+
+static uint32_t ds4_routed_dyn_hash_key(uint32_t layer, uint32_t expert) {
+    uint32_t k = (layer * 2654435761u) ^ (expert * 40503u);
+    return k & (DS4_ROUTED_DYN_HASH_SIZE - 1u);
+}
+
+static void ds4_routed_dyn_lru_unlink(int32_t idx) {
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    if (e->lru_prev >= 0) g_routed_dyn_entries[e->lru_prev].lru_next = e->lru_next;
+    else                  g_routed_dyn.lru_head = e->lru_next;
+    if (e->lru_next >= 0) g_routed_dyn_entries[e->lru_next].lru_prev = e->lru_prev;
+    else                  g_routed_dyn.lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = -1;
+}
+
+static void ds4_routed_dyn_lru_push_head(int32_t idx) {
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    e->lru_prev = -1;
+    e->lru_next = g_routed_dyn.lru_head;
+    if (g_routed_dyn.lru_head >= 0) g_routed_dyn_entries[g_routed_dyn.lru_head].lru_prev = idx;
+    g_routed_dyn.lru_head = idx;
+    if (g_routed_dyn.lru_tail < 0) g_routed_dyn.lru_tail = idx;
+}
+
+static void ds4_routed_dyn_hash_insert(int32_t idx) {
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    uint32_t b = ds4_routed_dyn_hash_key(e->layer, e->expert);
+    e->hash_next = g_routed_dyn_hash[b];
+    g_routed_dyn_hash[b] = idx;
+}
+
+static void ds4_routed_dyn_hash_remove(int32_t idx) {
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    uint32_t b = ds4_routed_dyn_hash_key(e->layer, e->expert);
+    int32_t cur = g_routed_dyn_hash[b];
+    int32_t prev = -1;
+    while (cur >= 0) {
+        if (cur == idx) {
+            if (prev < 0) g_routed_dyn_hash[b] = e->hash_next;
+            else          g_routed_dyn_entries[prev].hash_next = e->hash_next;
+            e->hash_next = -1;
+            return;
+        }
+        prev = cur;
+        cur = g_routed_dyn_entries[cur].hash_next;
+    }
+}
+
+static int32_t ds4_routed_dyn_lookup(uint32_t layer, uint32_t expert) {
+    uint32_t b = ds4_routed_dyn_hash_key(layer, expert);
+    int32_t cur = g_routed_dyn_hash[b];
+    while (cur >= 0) {
+        if (g_routed_dyn_entries[cur].layer == layer &&
+            g_routed_dyn_entries[cur].expert == expert) {
+            return cur;
+        }
+        cur = g_routed_dyn_entries[cur].hash_next;
+    }
+    return -1;
+}
+
+/* DS4_ROUTED_DYN_DEBUG=1: trace every site that mutates g_routed_dyn's wired
+ * working set (clear / evict / acquire-miss) so we can see, with NO guessing,
+ * whether the prior turn's wired experts are dropped by CODE (these sites fire)
+ * or by the OS under wired-limit pressure (these sites stay silent while
+ * wired_bytes stays high but vm_stat wired falls). */
+static int ds4_routed_dyn_debug(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_ROUTED_DYN_DEBUG");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+#define DS4_ROUTED_DYN_DBG(fmt, ...) do { \
+    if (ds4_routed_dyn_debug()) { \
+        fprintf(stderr, "ds4: [routed_dyn_dbg] " fmt \
+                " | live=%u wired_bytes=%.2f GiB hits=%llu misses=%llu evicts=%llu\n", \
+                ##__VA_ARGS__, \
+                g_routed_dyn.live_count, \
+                (double)g_routed_dyn.wired_bytes / (1024.0*1024.0*1024.0), \
+                (unsigned long long)g_routed_dyn.hits, \
+                (unsigned long long)g_routed_dyn.misses, \
+                (unsigned long long)g_routed_dyn.evicts); \
+    } \
+} while (0)
+
+static void ds4_routed_dyn_init(void) {
+    if (g_routed_dyn.initialized) return;
+    g_routed_dyn.initialized = 1;
+    g_routed_dyn.lru_head = g_routed_dyn.lru_tail = -1;
+    for (uint32_t i = 0; i < DS4_ROUTED_DYN_HASH_SIZE; i++) g_routed_dyn_hash[i] = -1;
+    /* build the free list (lru_next links free slots) */
+    g_routed_dyn.free_head = -1;
+    for (int32_t i = (int32_t)DS4_ROUTED_DYN_MAX_ENTRIES - 1; i >= 0; i--) {
+        g_routed_dyn_entries[i].in_use   = 0;
+        g_routed_dyn_entries[i].lru_prev = -1;
+        g_routed_dyn_entries[i].hash_next = -1;
+        g_routed_dyn_entries[i].lru_next = g_routed_dyn.free_head;
+        g_routed_dyn.free_head = i;
+    }
+    uint64_t budget_mib = 40960;   /* 40 GiB default */
+    const char *env = getenv("DS4_ROUTED_METAL_BUDGET_MIB");
+    if (env && env[0]) {
+        char *endp = NULL;
+        unsigned long long v = strtoull(env, &endp, 10);
+        if (endp != env && v > 0) budget_mib = (uint64_t)v;
+    }
+    g_routed_dyn.budget_bytes = budget_mib * 1024ull * 1024ull;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_routed_dyn";
+        desc.initialCapacity = 64;
+        NSError *error = nil;
+        g_routed_dyn_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (g_routed_dyn_residency_set) {
+            g_routed_dyn.have_set = 1;
+        } else {
+            fprintf(stderr, "ds4: routed-metal-dynamic residency set unavailable: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+        }
+    }
+    fprintf(stderr,
+            "ds4: routed-metal-dynamic enabled (budget %.2f GiB, residency-set=%s)\n",
+            (double)g_routed_dyn.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+            g_routed_dyn.have_set ? "yes" : "no(auto-residency)");
+}
+
+static int32_t ds4_routed_dyn_alloc_entry(void) {
+    int32_t idx = g_routed_dyn.free_head;
+    if (idx < 0) return -1;
+    g_routed_dyn.free_head = g_routed_dyn_entries[idx].lru_next;
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    e->in_use = 1;
+    e->gate = e->up = e->down = nil;
+    e->gate_inner = e->up_inner = e->down_inner = 0;
+    e->bytes = 0;
+    e->lru_prev = e->lru_next = -1;
+    e->hash_next = -1;
+    return idx;
+}
+
+static void ds4_routed_dyn_release_buffers(ds4_routed_dyn_entry *e) {
+    if (g_routed_dyn.have_set && (e->gate || e->up || e->down)) {
+        if (@available(macOS 15.0, *)) {
+            if (e->gate) [g_routed_dyn_residency_set removeAllocation:e->gate];
+            if (e->up)   [g_routed_dyn_residency_set removeAllocation:e->up];
+            if (e->down) [g_routed_dyn_residency_set removeAllocation:e->down];
+            g_routed_dyn.dirty = 1;
+        }
+    }
+    e->gate = nil;   /* ARC release -> underlying noCopy VM object is freed */
+    e->up   = nil;
+    e->down = nil;
+}
+
+static void ds4_routed_dyn_free_entry(int32_t idx) {
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    e->in_use    = 0;
+    e->layer     = 0;
+    e->expert    = 0;
+    e->bytes     = 0;
+    e->lru_prev  = -1;
+    e->hash_next = -1;
+    e->lru_next  = g_routed_dyn.free_head;
+    g_routed_dyn.free_head = idx;
+}
+
+static void ds4_routed_dyn_evict_one(void) {
+    int32_t idx = g_routed_dyn.lru_tail;
+    if (idx < 0) return;
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    DS4_ROUTED_DYN_DBG("evict_one layer=%u expert=%u bytes=%.1fMiB",
+                       e->layer, e->expert, (double)e->bytes / (1024.0*1024.0));
+    ds4_routed_dyn_lru_unlink(idx);
+    ds4_routed_dyn_hash_remove(idx);
+    if (g_routed_dyn.wired_bytes >= e->bytes) g_routed_dyn.wired_bytes -= e->bytes;
+    else                                      g_routed_dyn.wired_bytes = 0;
+    if (g_routed_dyn.live_count > 0) g_routed_dyn.live_count--;
+    ds4_routed_dyn_release_buffers(e);
+    ds4_routed_dyn_free_entry(idx);
+    g_routed_dyn.evicts++;
+}
+
+static void ds4_routed_dyn_evict_to_fit(uint64_t need_bytes) {
+    while (g_routed_dyn.lru_tail >= 0 &&
+           (g_routed_dyn.wired_bytes + need_bytes > g_routed_dyn.budget_bytes ||
+            g_routed_dyn.live_count + 1u > DS4_ROUTED_DYN_MAX_ENTRIES - 8u)) {
+        ds4_routed_dyn_evict_one();
+    }
+}
+
+/* Wrap a per-expert byte range of the model mmap in a fresh page-aligned
+ * noCopy Shared MTLBuffer.  Returns the buffer, the inner offset of the
+ * expert within it, and the page-rounded length (for wired accounting). */
+static id<MTLBuffer> ds4_routed_dyn_make_buffer(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t ebytes,
+        uint64_t *inner, uint64_t *rounded_len) {
+    const uint64_t page = (uint64_t)getpagesize();
+    if (model_size == 0 || offset > model_size || ebytes > model_size - offset) {
+        return nil;
+    }
+    const uint64_t page_off = offset & ~(page - 1);
+    const uint64_t leading  = offset - page_off;
+    const uint64_t len      = round_up_u64(leading + ebytes, page);
+    void *base = (void *)((uintptr_t)model_map + page_off);
+    /* Warm the file-backed pages via fcntl(F_RDADVISE) so the residency
+     * request does not block on SSD I/O: it issues a real async read into the
+     * unified buffer cache on APFS/HFS+ (harmless when already cached).  No
+     * madvise(WILLNEED) fallback -- on Darwin that only sets a vm_behavior hint
+     * and never issues I/O, so it bought nothing here.  When the fd is missing
+     * or DS4_PREFETCH_USE_RDADVISE=0 we simply skip the hint and let the
+     * residency request fault the pages in. */
+    if (g_model_fd >= 0 && ds4_prefetch_rdadvise_enabled()) {
+        ds4_rdadvise_range(g_model_fd, model_map, base, (size_t)len);
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:base
+                                                    length:(NSUInteger)len
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    if (!buf) return nil;
+    *inner = leading;
+    *rounded_len = len;
+    return buf;
+}
+
+/* Ensure (layer,expert) is wired and return its entry index, or -1 on
+ * failure.  Hit = move-to-MRU, no wiring.  Miss = create per-expert buffers,
+ * evict LRU to fit, add to the residency set (committed later in bulk). */
+static int32_t ds4_routed_dyn_acquire(
+        uint32_t layer, uint32_t expert,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_ebytes, uint64_t up_ebytes, uint64_t down_ebytes) {
+    int32_t idx = ds4_routed_dyn_lookup(layer, expert);
+    if (idx >= 0) {
+        ds4_routed_dyn_lru_unlink(idx);
+        ds4_routed_dyn_lru_push_head(idx);
+        g_routed_dyn.hits++;
+        return idx;
+    }
+    g_routed_dyn.misses++;
+    uint64_t gi = 0, ui = 0, di = 0, gl = 0, ul = 0, dl = 0;
+    id<MTLBuffer> gbuf = ds4_routed_dyn_make_buffer(model_map, model_size, gate_off, gate_ebytes, &gi, &gl);
+    id<MTLBuffer> ubuf = ds4_routed_dyn_make_buffer(model_map, model_size, up_off,   up_ebytes,   &ui, &ul);
+    id<MTLBuffer> dbuf = ds4_routed_dyn_make_buffer(model_map, model_size, down_off, down_ebytes, &di, &dl);
+    if (!gbuf || !ubuf || !dbuf) return -1;
+    const uint64_t need = gl + ul + dl;
+    ds4_routed_dyn_evict_to_fit(need);
+    idx = ds4_routed_dyn_alloc_entry();
+    if (idx < 0) return -1;
+    ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+    e->layer = layer;
+    e->expert = expert;
+    e->gate = gbuf;   /* ARC retain */
+    e->up   = ubuf;
+    e->down = dbuf;
+    e->gate_inner = gi;
+    e->up_inner   = ui;
+    e->down_inner = di;
+    e->bytes = need;
+    if (g_routed_dyn.have_set) {
+        if (@available(macOS 15.0, *)) {
+            [g_routed_dyn_residency_set addAllocation:gbuf];
+            [g_routed_dyn_residency_set addAllocation:ubuf];
+            [g_routed_dyn_residency_set addAllocation:dbuf];
+            g_routed_dyn.dirty = 1;
+        }
+    }
+    g_routed_dyn.wired_bytes += need;
+    if (g_routed_dyn.wired_bytes > g_routed_dyn.wired_peak) {
+        g_routed_dyn.wired_peak = g_routed_dyn.wired_bytes;
+    }
+    g_routed_dyn.live_count++;
+    ds4_routed_dyn_hash_insert(idx);
+    ds4_routed_dyn_lru_push_head(idx);
+    return idx;
+}
+
+/* Commit residency-set membership changes and wire the current set.  Called
+ * once per layer after all selected experts are acquired so a layer's misses
+ * page in together rather than one blocking call per expert. */
+static void ds4_routed_dyn_commit(void) {
+    if (!g_routed_dyn.have_set || !g_routed_dyn.dirty) return;
+    if (@available(macOS 15.0, *)) {
+        const double t0 = ds4_routed_dyn_debug() ? ds4_gpu_now_ms() : 0.0;
+        /* Sample OS wired just before the FIRST gen commit of the process: if
+         * it reads ~13 GiB (non-routed only) instead of ~93 GiB, the routed-dyn
+         * working set was NOT OS-resident going into gen (reclaimed during
+         * prefill) and this commit is about to re-fault all of it. */
+        static int s_first_commit = 1;
+        if (s_first_commit) { ds4_dbg_vm("dyn_commit_pre(1st)"); s_first_commit = 0; }
+        [g_routed_dyn_residency_set commit];
+        [g_routed_dyn_residency_set requestResidency];
+        g_routed_dyn.dirty = 0;
+        g_routed_dyn.requests++;
+        const double dt = ds4_gpu_now_ms() - t0;
+        DS4_ROUTED_DYN_DBG("commit requestResidency=%.3f ms", dt);
+        /* A slow commit (>50 ms) means real page-in happened: print the wired
+         * delta so a re-fault (e.g. the 14 s one) is unambiguous per turn. */
+        if (t0 != 0.0 && dt > 50.0) ds4_dbg_vm("dyn_commit_post(slow)");
+    }
+}
+
+void ds4_gpu_routed_dyn_stats_dump(void) {
+    if (!g_routed_dyn.initialized) return;
+    const uint64_t total = g_routed_dyn.hits + g_routed_dyn.misses;
+    /* Surface the F_RDADVISE warm counters here: the routed-metal-dynamic gen
+     * path issues them from ds4_routed_dyn_make_buffer (one per miss x gate/up/
+     * down) but never reaches ds4_prefetch_stats_dump, so this is the only
+     * periodic place they show up.  Counts are process-global (cumulative). */
+    uint64_t rd_calls = 0, rd_enotty = 0, rd_dropped = 0;
+    ds4_prefetch_rdadvise_stats(&rd_calls, &rd_enotty, &rd_dropped);
+    fprintf(stderr,
+            "ds4: routed-metal-dynamic stats: hits=%llu misses=%llu (hit%%=%.1f) "
+            "evicts=%llu live=%u wired=%.2f GiB peak=%.2f GiB budget=%.2f GiB requests=%llu "
+            "rdadvise=%llu enotty=%llu dropped=%llu\n",
+            (unsigned long long)g_routed_dyn.hits,
+            (unsigned long long)g_routed_dyn.misses,
+            total ? 100.0 * (double)g_routed_dyn.hits / (double)total : 0.0,
+            (unsigned long long)g_routed_dyn.evicts,
+            g_routed_dyn.live_count,
+            (double)g_routed_dyn.wired_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)g_routed_dyn.wired_peak  / (1024.0 * 1024.0 * 1024.0),
+            (double)g_routed_dyn.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+            (unsigned long long)g_routed_dyn.requests,
+            (unsigned long long)rd_calls,
+            (unsigned long long)rd_enotty,
+            (unsigned long long)rd_dropped);
+}
+
+void ds4_gpu_routed_dyn_clear(void) {
+    if (!g_routed_dyn.initialized) return;
+    DS4_ROUTED_DYN_DBG("CLEAR called (endResidency+removeAll+memset)");
+    if (g_routed_dyn.have_set) {
+        if (@available(macOS 15.0, *)) {
+            [g_routed_dyn_residency_set endResidency];
+            [g_routed_dyn_residency_set removeAllAllocations];
+        }
+    }
+    for (uint32_t i = 0; i < DS4_ROUTED_DYN_MAX_ENTRIES; i++) {
+        g_routed_dyn_entries[i].gate = nil;   /* ARC release */
+        g_routed_dyn_entries[i].up   = nil;
+        g_routed_dyn_entries[i].down = nil;
+        g_routed_dyn_entries[i].in_use = 0;
+    }
+    g_routed_dyn_residency_set = nil;
+    memset(&g_routed_dyn, 0, sizeof(g_routed_dyn));
+}
+
+int ds4_gpu_routed_moe_one_tensor_dynamic(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const int32_t          *selected_ids,
+        uint32_t                layer) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !gate || !up || !mid || !experts || !x || !model_map ||
+        !selected || !weights || !selected_ids ||
+        n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
+        return 0;
+    }
+    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
+
+    const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
+    const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
+    id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
+    id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+    if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
+        /* Unsupported quant type -> let the caller fall back to the CPU path. */
+        return 0;
+    }
+    ds4_routed_dyn_init();
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf       = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gatebuf    = ds4_gpu_tensor_buffer(gate);
+        id<MTLBuffer> upbuf      = ds4_gpu_tensor_buffer(up);
+        id<MTLBuffer> midbuf     = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf     = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> expertsbuf = ds4_gpu_tensor_buffer(experts);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf  = ds4_gpu_tensor_buffer(weights);
+        const uint64_t x_bytes   = (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+        if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !expertsbuf ||
+            !selectedbuf || !weightsbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(gate) < mid_bytes ||
+            ds4_gpu_tensor_bytes(up) < mid_bytes ||
+            ds4_gpu_tensor_bytes(mid) < mid_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes ||
+            ds4_gpu_tensor_bytes(experts) < (uint64_t)n_expert * out_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert * sizeof(float)) {
+            fprintf(stderr, "ds4: routed-metal-dynamic received undersized activation buffers\n");
+            return 0;
+        }
+
+        /* Acquire (wire) the per-expert weight working set for every selected
+         * expert, then commit the residency set once. */
+        id<MTLBuffer> e_gate[6], e_up[6], e_down[6];
+        uint64_t e_gate_inner[6], e_up_inner[6], e_down_inner[6];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            const uint32_t expert = (uint32_t)selected_ids[i];
+            if (expert >= n_total_expert) return 0;
+            const uint64_t g_off = gate_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t u_off = up_offset   + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t d_off = down_offset + (uint64_t)expert * down_expert_bytes;
+            int32_t idx = ds4_routed_dyn_acquire(layer, expert, model_map, model_size,
+                                                   g_off, u_off, d_off,
+                                                   gate_expert_bytes, gate_expert_bytes,
+                                                   down_expert_bytes);
+            if (idx < 0) return 0;   /* caller falls back to the CPU path */
+            ds4_routed_dyn_entry *e = &g_routed_dyn_entries[idx];
+            e_gate[i] = e->gate;       e_up[i] = e->up;       e_down[i] = e->down;
+            e_gate_inner[i] = e->gate_inner;
+            e_up_inner[i]   = e->up_inner;
+            e_down_inner[i] = e->down_inner;
+        }
+        ds4_routed_dyn_commit();
+
+        const uint32_t n_tokens = 1;
+        const uint32_t pair_rows = n_tokens * n_expert;
+        const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
+        const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+
+        /* Single-slot args (nei0=1, src1_expert_rows=1), nb02 forced to 0 so
+         * the per-expert buffer base is used directly. */
+        ds4_gpu_mul_mv_id_args gate_args =
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                          gate_row_bytes, gate_expert_bytes,
+                                          1, 1, n_tokens, gate_nr0);
+        gate_args.nb02 = 0;
+        ds4_gpu_mul_mv_id_args down_args =
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                          down_row_bytes, down_expert_bytes,
+                                          1, 1, n_tokens, down_nr0);
+        down_args.nb02 = 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = 1;
+
+        const NSUInteger sel_off       = ds4_gpu_tensor_offset(selected);
+        const NSUInteger x_off         = ds4_gpu_tensor_offset(x);
+        const NSUInteger gate_base_off = ds4_gpu_tensor_offset(gate);
+        const NSUInteger up_base_off   = ds4_gpu_tensor_offset(up);
+        const NSUInteger mid_base_off  = ds4_gpu_tensor_offset(mid);
+        const NSUInteger row_stride    = (NSUInteger)expert_mid_dim * sizeof(float);
+        const NSUInteger out_row_stride = (NSUInteger)out_dim * sizeof(float);
+
+        /* Gate + up: one single-slot dispatch per selected expert -> row i. */
+        for (uint32_t i = 0; ok && i < n_expert; i++) {
+            ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                            e_gate[i], (NSUInteger)e_gate_inner[i],
+                                            xbuf, x_off,
+                                            gatebuf, gate_base_off + (NSUInteger)i * row_stride,
+                                            selectedbuf, sel_off,
+                                            gate_smem, 2, false);
+            if (ok) {
+                ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                                e_up[i], (NSUInteger)e_up_inner[i],
+                                                xbuf, x_off,
+                                                upbuf, up_base_off + (NSUInteger)i * row_stride,
+                                                selectedbuf, sel_off,
+                                                gate_smem, 2, false);
+            }
+        }
+        /* SwiGLU + route weight over all rows (existing kernel, unchanged). */
+        if (ok) {
+            ok = ds4_gpu_encode_moe_swiglu_weight(cb,
+                                                    gatebuf, gate_base_off,
+                                                    upbuf, up_base_off,
+                                                    midbuf, mid_base_off,
+                                                    weightsbuf, ds4_gpu_tensor_offset(weights),
+                                                    expert_mid_dim, pair_rows, clamp, false);
+        }
+        /* Down: one single-slot dispatch per expert, reading mid row i.  For
+         * n_expert == 1 write straight to out; otherwise write per-expert rows
+         * and sum them. */
+        id<MTLBuffer> down_dst    = (n_expert == 1) ? outbuf : expertsbuf;
+        NSUInteger    down_dst_base = (n_expert == 1) ? ds4_gpu_tensor_offset(out)
+                                                      : ds4_gpu_tensor_offset(experts);
+        for (uint32_t i = 0; ok && i < n_expert; i++) {
+            ok = ds4_gpu_encode_mul_mv_id(cb, down_mv_pipeline, &down_args,
+                                            e_down[i], (NSUInteger)e_down_inner[i],
+                                            midbuf, mid_base_off + (NSUInteger)i * row_stride,
+                                            down_dst, down_dst_base + (NSUInteger)i * out_row_stride,
+                                            selectedbuf, sel_off,
+                                            down_smem, 2, false);
+        }
+        if (ok && n_expert > 1) {
+            ok = ds4_gpu_encode_moe_sum_experts(cb,
+                                                  expertsbuf, ds4_gpu_tensor_offset(experts),
+                                                  outbuf, ds4_gpu_tensor_offset(out),
+                                                  out_dim, n_expert, n_tokens);
+        }
+        if (!ok) return 0;
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "routed dynamic MoE")) return 0;
     }
 
     return 1;
