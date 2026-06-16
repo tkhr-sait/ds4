@@ -173,6 +173,11 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill(
         uint32_t prefill_chunk);
 bool ds4_log_is_tty(FILE *fp);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
+/* Cumulative hit/miss counters of the active SSD-streaming expert cache:
+ * residency-lru when DS4_METAL_ENABLE_STREAMING_RESIDENCY_LRU is on, otherwise
+ * the default pread stream cache.  Both stay zero when streaming is inactive or
+ * on a non-Metal build.  Used for per-chunk gen hit-rate logging. */
+void ds4_gpu_streaming_cache_hits_misses(uint64_t *hits, uint64_t *misses);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                int n_predict, int ctx_size,
                                ds4_token_emit_fn emit,

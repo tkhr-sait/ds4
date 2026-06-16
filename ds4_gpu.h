@@ -57,6 +57,11 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+/* Optional F_NOCACHE fd for the streaming expert pread pool (residency_lru
+ * prefill): reads bypass the unified buffer cache so the prefill layer sweep
+ * does not evict the gen working set.  Pass -1 to unset; the GPU layer owns the
+ * fd (closes it on replace and cleanup). */
+int ds4_gpu_set_model_nocache_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 /* Hand the page-cache-bypassing fd (DS4_METAL_ENABLE_STREAMING_NO_MMAP) and its I/O alignment to
  * the GPU TU so the SSD streaming pread path reads routed-expert bytes through
@@ -864,6 +869,85 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         uint32_t                layer_index);
+
+/* Experimental SSD-streaming gen path: run the routed MoE for this gen step on
+ * Metal by wiring ONLY the router-selected experts into a per-expert LRU
+ * residency set (zero-copy mmap views, bounded by a byte budget) instead of the
+ * full per-layer map / pread cache.  selected_ids is the host copy of the
+ * router-selected expert ids.  Returns 0 (caller falls back) on unsupported
+ * quant or residency failure.  See ds4_metal.m. */
+int ds4_gpu_routed_moe_one_tensor_residency_lru(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const int32_t          *selected_ids,
+        uint32_t                layer);
+
+/* Byte budget for the residency-lru residency LRU.  Wired from the
+ * ssd-streaming auto cache budget at engine init; env DS4_ROUTED_METAL_BUDGET_MIB
+ * overrides.  0 keeps the prior/default value. */
+void ds4_gpu_set_residency_lru_budget_bytes(uint64_t bytes);
+/* Full (gen-phase) residency-LRU budget in bytes, with no prefill-pread-cache
+ * subtraction.  Enables dynamic prefill/gen budget switching (see
+ * ds4_gpu_residency_lru_enter_gen/_prefill).  0 disables switching. */
+void ds4_gpu_set_residency_lru_gen_budget_bytes(uint64_t bytes);
+/* Raise the residency-lru LRU to the full gen budget (call after the prefill
+ * pread cache is released, before gen).  No-op unless switching is enabled. */
+void ds4_gpu_residency_lru_enter_gen(void);
+/* Shrink the residency-lru LRU back to the reduced prefill budget and evict the
+ * overflow (call before a prefill re-claims its pread cache).  No-op unless
+ * switching is enabled. */
+void ds4_gpu_residency_lru_enter_prefill(void);
+void ds4_gpu_residency_lru_stats_dump(void);
+void ds4_gpu_residency_lru_clear(void);
+/* Flush any deferred residency-lru residency commit; call once per token after
+ * the decode layer loop (the per-layer dispatch defers requestResidency by
+ * default to batch it).  No-op when nothing is pending. */
+void ds4_gpu_residency_lru_commit_pending(void);
+/* Release the streaming expert cache's slab buffers without changing the
+ * configured budget (they re-allocate lazily at the next layer-major prefill).
+ * Under residency-lru the cache is prefill-only, so call this when gen
+ * resumes to hand the (1+ahead)-layer double buffer's RAM back to the OS page
+ * cache.  No-op when the cache is already empty. */
+void ds4_gpu_stream_expert_cache_release(void);
+
+/* Prefetch a model file range for the residency-lru gen path (only
+ * reached on a residency-LRU miss; the LRU is the hot/cold judgement).  Issues
+ * F_RDADVISE asynchronously off the encode thread, split for SSD queue depth.
+ * F_RDADVISE is itself a no-op on already-cached pages, so real SSD I/O
+ * concentrates on cold ranges.  Env: DS4_PREFETCH_RDADVISE_ASYNC (default 1),
+ * DS4_PREFETCH_ASYNC_WORKERS (4), DS4_PREFETCH_ASYNC_SPLIT (4).  Defined in
+ * ds4.c (portable; F_RDADVISE is a no-op off Apple). */
+void ds4_prefetch_expert_range(int fd, uint64_t file_off, uint64_t len);
+
+/* Force-wire the current model views once even in ssd-streaming mode.  Used by
+ * the residency-lru gen path after installing the (non-routed-only)
+ * static-decode map, so the non-routed weights are pinned once instead of being
+ * re-managed by Metal automatic residency per command buffer.  No-op on
+ * macOS < 15 or when DS4_METAL_NO_RESIDENCY is set. */
+void ds4_gpu_request_model_residency(void);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,

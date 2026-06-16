@@ -172,6 +172,11 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/* Separate F_NOCACHE fd for the streaming expert pread pool (>= 0 only under
+ * residency-lru).  Reads through it bypass the unified buffer cache, so
+ * the layer-sweeping prefill no longer evicts the gen working set from the OS
+ * page cache.  Owned here (closed on replace/cleanup). */
+static int g_model_fd_nocache = -1;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -1406,13 +1411,9 @@ static void ds4_gpu_model_residency_clear(void) {
     g_model_residency_added_to_queue = 0;
 }
 
-static int ds4_gpu_model_residency_request_views(void) {
-    if (g_model_view_count == 0 ||
-        g_ssd_streaming_mode ||
-        getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
-        return 1;
-    }
-
+/* Build one residency set over the current model views and wire it.  Assumes
+ * g_model_residency_set is nil (caller cleared it).  macOS 15+ only. */
+static int ds4_gpu_model_residency_build_set(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
         /*
@@ -1449,8 +1450,39 @@ static int ds4_gpu_model_residency_request_views(void) {
         g_model_residency_count = g_model_view_count;
     }
 #endif
-
     return 1;
+}
+
+static int ds4_gpu_model_residency_request_views(void) {
+    if (g_model_view_count == 0 ||
+        g_ssd_streaming_mode ||
+        getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
+        return 1;
+    }
+    return ds4_gpu_model_residency_build_set();
+}
+
+/* Public: force-wire the CURRENT model views once, even in ssd-streaming mode
+ * (where ds4_gpu_model_residency_request_views deliberately skips wiring).  The
+ * residency-lru gen path calls this right after installing the
+ * static-decode map so the bounded non-routed weights (~8 GiB, no routed
+ * experts) are pinned once -- like cpu-moe -- instead of being re-managed by
+ * Metal automatic residency on every per-layer command buffer.  The caller must
+ * only invoke it when the current map excludes routed experts. */
+void ds4_gpu_request_model_residency(void) {
+    if (!g_initialized ||
+        g_model_view_count == 0 ||
+        getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
+        return;
+    }
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        ds4_gpu_model_residency_clear();
+        if (!ds4_gpu_model_residency_build_set()) {
+            ds4_gpu_model_residency_clear();
+        }
+    }
+#endif
 }
 
 static int ds4_gpu_add_model_view_range(
@@ -2947,6 +2979,19 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
     }
+}
+
+/* Release the streaming expert cache's slab buffers (and entries) without
+ * touching the configured budget, so the next layer-major prefill re-allocates
+ * them lazily.  Under residency-lru the cache is prefill-only; freeing
+ * it when gen resumes hands its RAM (the (1+ahead)-layer double buffer) back
+ * to the OS page cache that serves the gen LRU misses. */
+void ds4_gpu_stream_expert_cache_release(void) {
+    if (g_stream_expert_cache_slab_count == 0 &&
+        g_stream_expert_cache_entry_count == 0) {
+        return;
+    }
+    ds4_gpu_stream_expert_cache_clear_all(0);
 }
 
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -6692,6 +6737,12 @@ void ds4_gpu_cleanup(void) {
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
+        ds4_gpu_residency_lru_stats_dump();
+        ds4_gpu_residency_lru_clear();
+        if (g_model_fd_nocache >= 0) {
+            close(g_model_fd_nocache);
+            g_model_fd_nocache = -1;
+        }
         ds4_gpu_stream_nommap_persist_clear();   /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned non-routed tier */
         ds4_gpu_stream_nommap_routed_free();     /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned routed prefill tier */
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
@@ -7275,6 +7326,14 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
+    return 1;
+}
+
+int ds4_gpu_set_model_nocache_fd(int fd) {
+    if (g_model_fd_nocache >= 0 && g_model_fd_nocache != fd) {
+        close(g_model_fd_nocache);
+    }
+    g_model_fd_nocache = fd;
     return 1;
 }
 
@@ -8209,13 +8268,17 @@ static int ds4_gpu_model_read_into(uint8_t *dst, uint64_t offset, uint64_t len) 
         return 0;
     }
     if (g_stream_nommap_fd < 0) {
+        /* residency_lru prefill: route the streaming-cache pread through the
+         * dedicated F_NOCACHE fd (set by residency-lru) so the prefill
+         * layer sweep does not churn the unified buffer cache. */
+        const int pread_fd = g_model_fd_nocache >= 0 ? g_model_fd_nocache : g_model_fd;
         uint64_t pos = 0;
         while (pos < len) {
             const uint64_t rem = len - pos;
             size_t want = rem > DS4_PREAD_CHUNK ? (size_t)DS4_PREAD_CHUNK : (size_t)rem;
             ssize_t nread;
             do {
-                nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+                nread = pread(pread_fd, dst + pos, want, (off_t)(offset + pos));
             } while (nread < 0 && errno == EINTR);
             if (nread <= 0) {
                 return 0;
@@ -9339,12 +9402,14 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
         uint32_t n_expert,
         uint32_t gate_type,
         uint32_t down_type) {
+    const int iq2_layout =
+        gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+        down_type == DS4_METAL_TENSOR_Q2_K;
     if (!g_ssd_streaming_mode ||
         n_tokens <= 1 ||
         n_total_expert == 0 ||
         n_expert != 6 ||
-        gate_type != DS4_METAL_TENSOR_IQ2_XXS ||
-        down_type != DS4_METAL_TENSOR_Q2_K ||
+        !iq2_layout ||
         g_quality_mode ||
         getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
@@ -10052,6 +10117,15 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
     for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        if (g_stream_expert_cache_slabs[i]) {
+            /* Return the pages to the OS for real: releasing the buffer alone
+             * leaves its memory in Metal's allocator pool as resident
+             * anonymous pages (observed: 13.3 GiB of freed prefill slabs
+             * surviving the release and getting compressed at gen start,
+             * lingering in the compressor through the whole gen).  All
+             * callers sit at sync points, so the contents are dead. */
+            [g_stream_expert_cache_slabs[i] setPurgeableState:MTLPurgeableStateEmpty];
+        }
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
         g_stream_expert_cache_slab_slot_count[i] = 0;
@@ -22840,6 +22914,793 @@ int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n
     return 1;
 }
 
+/* ===================================================================
+ * residency-lru: per-expert mmap residency LRU for SSD streaming
+ *
+ * Adapted from the tkhr-sait cpu-moe fork.  In --ssd-streaming the routed
+ * experts are normally either pread-copied into the IQ2/Q2 streaming expert
+ * cache, or (for Q4_K) faulted in via the full per-layer model map every gen
+ * token.  This module instead wraps ONLY the router-selected experts of the
+ * current gen step as page-aligned zero-copy (newBufferWithBytesNoCopy)
+ * buffers and keeps them wired in a dedicated MTLResidencySet bounded by an
+ * LRU byte budget, so a token's hot experts stay GPU-resident across tokens
+ * instead of re-faulting from SSD/page-cache.  F_RDADVISE warms the file pages
+ * before the residency request so it does not block on I/O.  The compute reuses
+ * the existing mul_mv_id / swiglu-weight / sum-experts encoders verbatim: each
+ * selected expert is a single-slot (nei0=1) mul_mv_id with nb02 forced to 0.
+ * macOS 15+ provides explicit wire/unwire; older falls back to Metal automatic
+ * residency, still bounded by the same LRU (release-on-evict).
+ * =================================================================== */
+
+#define DS4_RESIDENCY_LRU_MAX_ENTRIES 16384u
+#define DS4_RESIDENCY_LRU_HASH_SIZE   16384u   /* power of two */
+
+typedef struct {
+    uint32_t layer;
+    uint32_t expert;
+    uint8_t  in_use;
+    __strong id<MTLBuffer> gate;
+    __strong id<MTLBuffer> up;
+    __strong id<MTLBuffer> down;
+    uint64_t gate_inner;
+    uint64_t up_inner;
+    uint64_t down_inner;
+    uint64_t bytes;            /* sum of the three page-rounded buffer lengths */
+    int32_t  lru_prev;         /* entry index, -1 = none (also free-list link) */
+    int32_t  lru_next;
+    int32_t  hash_next;        /* entry index, -1 = none */
+} ds4_residency_lru_entry;
+
+static ds4_residency_lru_entry g_residency_lru_entries[DS4_RESIDENCY_LRU_MAX_ENTRIES];
+static int32_t g_residency_lru_hash[DS4_RESIDENCY_LRU_HASH_SIZE];
+static id      g_residency_lru_set = nil;   /* id<MTLResidencySet>, macOS 15+ */
+static uint64_t g_residency_lru_budget_override_bytes; /* 0 = env/default; the PREFILL-phase budget (reduced by the pread cache share) */
+/* gen-phase residency-LRU budget (the FULL ssd-streaming budget, no pread-cache
+ * subtraction).  0 = dynamic prefill/gen budget switching disabled (env override
+ * in effect, or non-residency-lru).  See ds4_gpu_residency_lru_enter_gen(). */
+static uint64_t g_residency_lru_gen_budget_bytes;
+
+/* DS4_RESIDENCY_LRU_PROFILE: split per-dispatch wall time into the CPU-side miss
+ * path (noCopy buffer creation + prefetch + evict + residency add), the
+ * residency commit (requestResidency), and the GPU command-buffer wait.  Lets us
+ * compare against the pread cache's pread_ms and locate the low-budget gen floor
+ * (is it CPU miss overhead, residency churn, or synchronous GPU page faults?).
+ * Resolved once in ds4_residency_lru_init().  0 = off (no timing calls). */
+static int    g_residency_lru_profile = -1;
+static double g_mmap_zc_prof_miss_ms;     /* CPU miss path (acquire misses) */
+static double g_mmap_zc_prof_commit_ms;   /* requestResidency */
+static double g_mmap_zc_prof_gpu_ms;      /* command-buffer commit+wait */
+static uint64_t g_mmap_zc_prof_dispatches;/* gen MoE dispatches (layer x token) */
+
+static struct {
+    int      initialized;
+    int      have_set;             /* residency set available + created */
+    int      added_to_queue;       /* set attached to g_queue -> commit suffices */
+    int32_t  lru_head;             /* MRU, -1 = empty */
+    int32_t  lru_tail;             /* LRU */
+    int32_t  free_head;            /* free-list head, -1 = empty */
+    uint64_t wired_bytes;
+    uint64_t budget_bytes;
+    uint64_t wired_peak;
+    uint32_t live_count;
+    int      dirty;                /* residency membership changed since last commit */
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evicts;
+    uint64_t requests;             /* commit+requestResidency calls */
+    uint32_t pending_adds;         /* expert adds since last commit (batching) */
+} g_residency_lru;
+
+void ds4_gpu_set_residency_lru_budget_bytes(uint64_t bytes) {
+    g_residency_lru_budget_override_bytes = bytes;
+}
+
+void ds4_gpu_set_residency_lru_gen_budget_bytes(uint64_t bytes) {
+    g_residency_lru_gen_budget_bytes = bytes;
+}
+
+static uint32_t ds4_residency_lru_hash_key(uint32_t layer, uint32_t expert) {
+    uint32_t k = (layer * 2654435761u) ^ (expert * 40503u);
+    return k & (DS4_RESIDENCY_LRU_HASH_SIZE - 1u);
+}
+
+static void ds4_residency_lru_lru_unlink(int32_t idx) {
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    if (e->lru_prev >= 0) g_residency_lru_entries[e->lru_prev].lru_next = e->lru_next;
+    else                  g_residency_lru.lru_head = e->lru_next;
+    if (e->lru_next >= 0) g_residency_lru_entries[e->lru_next].lru_prev = e->lru_prev;
+    else                  g_residency_lru.lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = -1;
+}
+
+static void ds4_residency_lru_lru_push_head(int32_t idx) {
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    e->lru_prev = -1;
+    e->lru_next = g_residency_lru.lru_head;
+    if (g_residency_lru.lru_head >= 0) g_residency_lru_entries[g_residency_lru.lru_head].lru_prev = idx;
+    g_residency_lru.lru_head = idx;
+    if (g_residency_lru.lru_tail < 0) g_residency_lru.lru_tail = idx;
+}
+
+static void ds4_residency_lru_hash_insert(int32_t idx) {
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    uint32_t b = ds4_residency_lru_hash_key(e->layer, e->expert);
+    e->hash_next = g_residency_lru_hash[b];
+    g_residency_lru_hash[b] = idx;
+}
+
+static void ds4_residency_lru_hash_remove(int32_t idx) {
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    uint32_t b = ds4_residency_lru_hash_key(e->layer, e->expert);
+    int32_t cur = g_residency_lru_hash[b];
+    int32_t prev = -1;
+    while (cur >= 0) {
+        if (cur == idx) {
+            if (prev < 0) g_residency_lru_hash[b] = e->hash_next;
+            else          g_residency_lru_entries[prev].hash_next = e->hash_next;
+            e->hash_next = -1;
+            return;
+        }
+        prev = cur;
+        cur = g_residency_lru_entries[cur].hash_next;
+    }
+}
+
+static int32_t ds4_residency_lru_lookup(uint32_t layer, uint32_t expert) {
+    uint32_t b = ds4_residency_lru_hash_key(layer, expert);
+    int32_t cur = g_residency_lru_hash[b];
+    while (cur >= 0) {
+        if (g_residency_lru_entries[cur].layer == layer &&
+            g_residency_lru_entries[cur].expert == expert) {
+            return cur;
+        }
+        cur = g_residency_lru_entries[cur].hash_next;
+    }
+    return -1;
+}
+
+static void ds4_residency_lru_init(void) {
+    if (g_residency_lru.initialized) return;
+    g_residency_lru.initialized = 1;
+    if (g_residency_lru_profile < 0) {
+        g_residency_lru_profile = getenv("DS4_RESIDENCY_LRU_PROFILE") != NULL;
+    }
+    g_residency_lru.lru_head = g_residency_lru.lru_tail = -1;
+    for (uint32_t i = 0; i < DS4_RESIDENCY_LRU_HASH_SIZE; i++) g_residency_lru_hash[i] = -1;
+    /* build the free list (lru_next links free slots) */
+    g_residency_lru.free_head = -1;
+    for (int32_t i = (int32_t)DS4_RESIDENCY_LRU_MAX_ENTRIES - 1; i >= 0; i--) {
+        g_residency_lru_entries[i].in_use   = 0;
+        g_residency_lru_entries[i].lru_prev = -1;
+        g_residency_lru_entries[i].hash_next = -1;
+        g_residency_lru_entries[i].lru_next = g_residency_lru.free_head;
+        g_residency_lru.free_head = i;
+    }
+    /* Budget: env DS4_ROUTED_METAL_BUDGET_MIB overrides; else the ssd-streaming
+     * auto budget pushed via ds4_gpu_set_residency_lru_budget_bytes(); else 40 GiB. */
+    uint64_t budget_bytes = 0;
+    const char *env = getenv("DS4_ROUTED_METAL_BUDGET_MIB");
+    if (env && env[0]) {
+        char *endp = NULL;
+        unsigned long long v = strtoull(env, &endp, 10);
+        if (endp != env && v > 0) budget_bytes = (uint64_t)v * 1024ull * 1024ull;
+    }
+    if (budget_bytes == 0) budget_bytes = g_residency_lru_budget_override_bytes;
+    if (budget_bytes == 0) budget_bytes = 40960ull * 1024ull * 1024ull;
+    g_residency_lru.budget_bytes = budget_bytes;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_residency_lru";
+        desc.initialCapacity = 64;
+        NSError *error = nil;
+        g_residency_lru_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (g_residency_lru_set) {
+            g_residency_lru.have_set = 1;
+        } else {
+            fprintf(stderr, "ds4: residency-lru residency set unavailable: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+        }
+    }
+    /* budget_bytes here is the init seed (the reduced prefill budget); the gen
+     * dispatch raises it to the gen budget via enter_gen() immediately after.
+     * Print both so the log isn't mistaken for the operating gen budget. */
+    if (g_residency_lru_gen_budget_bytes != 0) {
+        fprintf(stderr,
+                "ds4: residency-lru enabled (prefill budget %.2f GiB -> gen budget %.2f GiB, residency-set=%s)\n",
+                (double)g_residency_lru.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)g_residency_lru_gen_budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                g_residency_lru.have_set ? "yes" : "no(auto-residency)");
+    } else {
+        fprintf(stderr,
+                "ds4: residency-lru enabled (budget %.2f GiB, residency-set=%s)\n",
+                (double)g_residency_lru.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                g_residency_lru.have_set ? "yes" : "no(auto-residency)");
+    }
+}
+
+static int32_t ds4_residency_lru_alloc_entry(void) {
+    int32_t idx = g_residency_lru.free_head;
+    if (idx < 0) return -1;
+    g_residency_lru.free_head = g_residency_lru_entries[idx].lru_next;
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    e->in_use = 1;
+    e->gate = e->up = e->down = nil;
+    e->gate_inner = e->up_inner = e->down_inner = 0;
+    e->bytes = 0;
+    e->lru_prev = e->lru_next = -1;
+    e->hash_next = -1;
+    return idx;
+}
+
+static void ds4_residency_lru_release_buffers(ds4_residency_lru_entry *e) {
+    if (g_residency_lru.have_set && (e->gate || e->up || e->down)) {
+        if (@available(macOS 15.0, *)) {
+            if (e->gate) [g_residency_lru_set removeAllocation:e->gate];
+            if (e->up)   [g_residency_lru_set removeAllocation:e->up];
+            if (e->down) [g_residency_lru_set removeAllocation:e->down];
+            g_residency_lru.dirty = 1;
+        }
+    }
+    e->gate = nil;   /* ARC release -> underlying noCopy VM object is freed */
+    e->up   = nil;
+    e->down = nil;
+}
+
+static void ds4_residency_lru_free_entry(int32_t idx) {
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    e->in_use    = 0;
+    e->layer     = 0;
+    e->expert    = 0;
+    e->bytes     = 0;
+    e->lru_prev  = -1;
+    e->hash_next = -1;
+    e->lru_next  = g_residency_lru.free_head;
+    g_residency_lru.free_head = idx;
+}
+
+static void ds4_residency_lru_evict_one(void) {
+    int32_t idx = g_residency_lru.lru_tail;
+    if (idx < 0) return;
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    /* No per-eviction debug print: at a full budget this fires per miss
+     * (hundreds of thousands of lines).  The teardown stats report the evict
+     * total instead. */
+    ds4_residency_lru_lru_unlink(idx);
+    ds4_residency_lru_hash_remove(idx);
+    if (g_residency_lru.wired_bytes >= e->bytes) g_residency_lru.wired_bytes -= e->bytes;
+    else                                      g_residency_lru.wired_bytes = 0;
+    if (g_residency_lru.live_count > 0) g_residency_lru.live_count--;
+    ds4_residency_lru_release_buffers(e);
+    ds4_residency_lru_free_entry(idx);
+    g_residency_lru.evicts++;
+}
+
+static void ds4_residency_lru_evict_to_fit(uint64_t need_bytes) {
+    while (g_residency_lru.lru_tail >= 0 &&
+           (g_residency_lru.wired_bytes + need_bytes > g_residency_lru.budget_bytes ||
+            g_residency_lru.live_count + 1u > DS4_RESIDENCY_LRU_MAX_ENTRIES - 8u)) {
+        ds4_residency_lru_evict_one();
+    }
+}
+
+/* Prefill/gen budget switching for residency-lru.
+ *
+ * The prefill pread cache reserves (1+prepare_ahead) layers of experts out of
+ * the ssd-streaming budget, leaving the gen residency-LRU only the remainder
+ * (the prefill cache slab and the gen LRU were sized to share one RAM bound).
+ * But the prefill slab is freed at end-of-prompt BEFORE gen runs, so during gen
+ * that reserved RAM is idle -- the LRU could use the full budget.  Raise the LRU
+ * to the full budget for gen, and shrink it back before the next prefill (whose
+ * pread cache re-claims its share) to keep the combined resident set bounded.
+ *
+ * No-op unless ds4_gpu_set_residency_lru_gen_budget_bytes() supplied a full
+ * budget (i.e. dynamic switching is enabled: residency-lru active and no
+ * DS4_ROUTED_METAL_BUDGET_MIB override).  Both are safe before init (the values
+ * just shadow into g_residency_lru.budget_bytes, which init sets from the
+ * prefill override anyway). */
+void ds4_gpu_residency_lru_enter_gen(void) {
+    if (g_residency_lru_gen_budget_bytes == 0) return;          /* switching disabled */
+    if (!g_residency_lru.initialized) return;                   /* init will pick prefill budget */
+    /* Pure raise: nothing to evict, the next miss fills toward the larger bound. */
+    g_residency_lru.budget_bytes = g_residency_lru_gen_budget_bytes;
+}
+
+void ds4_gpu_residency_lru_enter_prefill(void) {
+    if (g_residency_lru_gen_budget_bytes == 0) return;          /* switching disabled */
+    if (!g_residency_lru.initialized) return;
+    /* Make room for the about-to-be-allocated prefill pread cache by evicting the
+     * gen-warmed residency LRU down to the reduced (prefill) bound RIGHT HERE --
+     * then immediately restore the full budget.  The LRU is not inserted during a
+     * layer-major prefill (it serves the pread cache, not the LRU), so it stays at
+     * the reduced size for the prefill's duration without holding the budget down.
+     * Restoring now (instead of in enter_gen) means the budget is never left in a
+     * reduced state that a missed enter_gen could strand -- a stranded reduced
+     * budget caps the gen LRU and silently makes decode very slow.  enter_gen is
+     * now a redundant idempotent backstop. */
+    g_residency_lru.budget_bytes = g_residency_lru_budget_override_bytes;  /* reduced (for the evict) */
+    ds4_residency_lru_evict_to_fit(0);
+    g_residency_lru.budget_bytes = g_residency_lru_gen_budget_bytes;       /* restore full immediately */
+}
+
+/* Wrap a per-expert byte range of the model mmap in a fresh page-aligned
+ * noCopy Shared MTLBuffer.  Returns the buffer, the inner offset of the expert
+ * within it, and the page-rounded length (for wired accounting). */
+static id<MTLBuffer> ds4_residency_lru_make_buffer(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t ebytes,
+        uint64_t *inner, uint64_t *rounded_len) {
+    const uint64_t page = (uint64_t)getpagesize();
+    if (model_size == 0 || offset > model_size || ebytes > model_size - offset) {
+        return nil;
+    }
+    const uint64_t page_off = offset & ~(page - 1);
+    const uint64_t leading  = offset - page_off;
+    const uint64_t len      = round_up_u64(leading + ebytes, page);
+    void *base = (void *)((uintptr_t)model_map + page_off);
+    /* The model is mmap'd from file offset 0, so the file offset of base is
+     * page_off.  Warm those pages before the residency request faults them.
+     * Only reached on an LRU miss, so this is already the cold set; the miss is
+     * prefetched asynchronously, split for SSD queue depth. */
+    if (g_model_fd >= 0) {
+        ds4_prefetch_expert_range(g_model_fd, page_off, len);
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:base
+                                                    length:(NSUInteger)len
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    if (!buf) return nil;
+    *inner = leading;
+    *rounded_len = len;
+    return buf;
+}
+
+/* Ensure (layer,expert) is wired and return its entry index, or -1 on failure.
+ * Hit = move-to-MRU, no wiring.  Miss = create per-expert buffers, evict LRU to
+ * fit, add to the residency set (committed later in bulk). */
+static int32_t ds4_residency_lru_acquire(
+        uint32_t layer, uint32_t expert,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_ebytes, uint64_t up_ebytes, uint64_t down_ebytes) {
+    int32_t idx = ds4_residency_lru_lookup(layer, expert);
+    if (idx >= 0) {
+        ds4_residency_lru_lru_unlink(idx);
+        ds4_residency_lru_lru_push_head(idx);
+        g_residency_lru.hits++;
+        return idx;
+    }
+    g_residency_lru.misses++;
+    const double prof_t0 = g_residency_lru_profile ? ds4_gpu_now_ms() : 0.0;
+    uint64_t gi = 0, ui = 0, di = 0, gl = 0, ul = 0, dl = 0;
+    id<MTLBuffer> gbuf = ds4_residency_lru_make_buffer(model_map, model_size, gate_off, gate_ebytes, &gi, &gl);
+    id<MTLBuffer> ubuf = ds4_residency_lru_make_buffer(model_map, model_size, up_off,   up_ebytes,   &ui, &ul);
+    id<MTLBuffer> dbuf = ds4_residency_lru_make_buffer(model_map, model_size, down_off, down_ebytes, &di, &dl);
+    if (!gbuf || !ubuf || !dbuf) return -1;
+    const uint64_t need = gl + ul + dl;
+    ds4_residency_lru_evict_to_fit(need);
+    idx = ds4_residency_lru_alloc_entry();
+    if (idx < 0) return -1;
+    ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+    e->layer = layer;
+    e->expert = expert;
+    e->gate = gbuf;   /* ARC retain */
+    e->up   = ubuf;
+    e->down = dbuf;
+    e->gate_inner = gi;
+    e->up_inner   = ui;
+    e->down_inner = di;
+    e->bytes = need;
+    if (g_residency_lru.have_set) {
+        if (@available(macOS 15.0, *)) {
+            [g_residency_lru_set addAllocation:gbuf];
+            [g_residency_lru_set addAllocation:ubuf];
+            [g_residency_lru_set addAllocation:dbuf];
+            g_residency_lru.dirty = 1;
+            g_residency_lru.pending_adds++;
+        }
+    }
+    g_residency_lru.wired_bytes += need;
+    if (g_residency_lru.wired_bytes > g_residency_lru.wired_peak) {
+        g_residency_lru.wired_peak = g_residency_lru.wired_bytes;
+    }
+    g_residency_lru.live_count++;
+    ds4_residency_lru_hash_insert(idx);
+    ds4_residency_lru_lru_push_head(idx);
+    if (g_residency_lru_profile) g_mmap_zc_prof_miss_ms += ds4_gpu_now_ms() - prof_t0;
+    return idx;
+}
+
+/* Commit residency-set membership changes and wire the current set.  The
+ * requestResidency MUST stay unconditional per commit: it keeps re-asserting
+ * residency against OS reclaim, so each call only re-wires a small delta and
+ * stays cheap (7-18 ms short-ctx).  Throttling it lets the decay accumulate
+ * into a spiral (each request grew 25->500+ ms, gen 1.23 -> 0.5 t/s measured).
+ * Do not re-add a throttle here. */
+static void ds4_residency_lru_commit(void) {
+    if (!g_residency_lru.have_set || !g_residency_lru.dirty) return;
+    if (@available(macOS 15.0, *)) {
+        const double prof_t0 = g_residency_lru_profile ? ds4_gpu_now_ms() : 0.0;
+        [g_residency_lru_set commit];
+        [g_residency_lru_set requestResidency];
+        g_residency_lru.dirty = 0;
+        g_residency_lru.pending_adds = 0;
+        g_residency_lru.requests++;
+        if (g_residency_lru_profile) g_mmap_zc_prof_commit_ms += ds4_gpu_now_ms() - prof_t0;
+    }
+}
+
+/* Commit batching: a layer's GEMV reads its experts via Metal automatic
+ * residency, so requestResidency is only needed to *persist* the wire for
+ * future hits.  It is deferred to one commit per token
+ * (ds4_gpu_residency_lru_commit_pending, called from the decode loop) instead of one
+ * per layer; a fixed safety threshold still commits mid-token if a caller never
+ * flushes. */
+#define DS4_RESIDENCY_LRU_COMMIT_BATCH_MAX 256u
+
+/* Called once per layer by the dynamic dispatch.  Defers the residency commit,
+ * committing only when the pending-add safety threshold is reached. */
+static void ds4_residency_lru_commit_maybe(void) {
+    if (!g_residency_lru.dirty) return;
+    if (g_residency_lru.pending_adds >= DS4_RESIDENCY_LRU_COMMIT_BATCH_MAX) {
+        ds4_residency_lru_commit();
+    }
+}
+
+/* Flush any deferred residency commit -- call once per token after the layer
+ * loop so the token's newly wired experts persist for the next token's hits. */
+void ds4_gpu_residency_lru_commit_pending(void) {
+    ds4_residency_lru_commit();
+}
+
+/* Hit/miss counters of whichever streaming expert cache is active this run:
+ * the residency-lru cache once it has been initialized (opt-in), otherwise the
+ * default pread stream cache.  Lets the gen loop log a per-chunk hit rate
+ * without knowing which backing strategy is in effect. */
+void ds4_gpu_streaming_cache_hits_misses(uint64_t *hits, uint64_t *misses) {
+    if (g_residency_lru.initialized) {
+        if (hits)   *hits   = g_residency_lru.hits;
+        if (misses) *misses = g_residency_lru.misses;
+    } else {
+        if (hits)   *hits   = g_stream_expert_cache_hits;
+        if (misses) *misses = g_stream_expert_cache_misses;
+    }
+}
+
+void ds4_gpu_residency_lru_stats_dump(void) {
+    if (!g_residency_lru.initialized) return;
+    const uint64_t total = g_residency_lru.hits + g_residency_lru.misses;
+    fprintf(stderr,
+            "ds4: residency-lru stats: hits=%llu misses=%llu (hit%%=%.1f) "
+            "evicts=%llu live=%u wired=%.2f GiB peak=%.2f GiB budget=%.2f GiB requests=%llu\n",
+            (unsigned long long)g_residency_lru.hits,
+            (unsigned long long)g_residency_lru.misses,
+            total ? 100.0 * (double)g_residency_lru.hits / (double)total : 0.0,
+            (unsigned long long)g_residency_lru.evicts,
+            g_residency_lru.live_count,
+            (double)g_residency_lru.wired_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)g_residency_lru.wired_peak  / (1024.0 * 1024.0 * 1024.0),
+            (double)g_residency_lru.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+            (unsigned long long)g_residency_lru.requests);
+    if (g_residency_lru_profile && g_mmap_zc_prof_dispatches) {
+        const double d = (double)g_mmap_zc_prof_dispatches;
+        const double m = g_residency_lru.misses ? (double)g_residency_lru.misses : 1.0;
+        fprintf(stderr,
+                "ds4: residency-lru profile: dispatches=%llu | "
+                "miss_cpu=%.0f ms (%.4f ms/miss) commit=%.0f ms gpu_wait=%.0f ms (%.4f ms/dispatch) | "
+                "per-dispatch: miss_cpu=%.4f commit=%.4f gpu=%.4f ms\n",
+                (unsigned long long)g_mmap_zc_prof_dispatches,
+                g_mmap_zc_prof_miss_ms, g_mmap_zc_prof_miss_ms / m,
+                g_mmap_zc_prof_commit_ms,
+                g_mmap_zc_prof_gpu_ms, g_mmap_zc_prof_gpu_ms / d,
+                g_mmap_zc_prof_miss_ms / d, g_mmap_zc_prof_commit_ms / d,
+                g_mmap_zc_prof_gpu_ms / d);
+    }
+}
+
+void ds4_gpu_residency_lru_clear(void) {
+    if (!g_residency_lru.initialized) return;
+    if (g_residency_lru.have_set) {
+        if (@available(macOS 15.0, *)) {
+            [g_residency_lru_set endResidency];
+            [g_residency_lru_set removeAllAllocations];
+        }
+    }
+    for (uint32_t i = 0; i < DS4_RESIDENCY_LRU_MAX_ENTRIES; i++) {
+        g_residency_lru_entries[i].gate = nil;   /* ARC release */
+        g_residency_lru_entries[i].up   = nil;
+        g_residency_lru_entries[i].down = nil;
+        g_residency_lru_entries[i].in_use = 0;
+    }
+    g_residency_lru_set = nil;
+    memset(&g_residency_lru, 0, sizeof(g_residency_lru));
+}
+
+int ds4_gpu_routed_moe_one_tensor_residency_lru(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const int32_t          *selected_ids,
+        uint32_t                layer) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !gate || !up || !mid || !experts || !x || !model_map ||
+        !selected || !weights || !selected_ids ||
+        n_total_expert == 0 || n_expert == 0 || n_expert > 6) {
+        return 0;
+    }
+    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
+
+    const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
+    const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
+    id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
+    id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+    if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
+        /* Unsupported quant type -> let the caller fall back. */
+        return 0;
+    }
+    ds4_residency_lru_init();
+    /* Raise the LRU to the full gen budget here, not at prefill end: this
+     * dispatch is the ONLY site that actually serves experts from the LRU (gen
+     * and the short decode-streaming prefill), and init is lazy -- it first runs
+     * on the first gen dispatch, AFTER the turn-1 layer-major prefill, so the
+     * prefill-end enter_gen() hook is a no-op (LRU not yet initialized) and later
+     * prompts are too short to take the layer-major path.  The layer-major
+     * (pread-cache) prefill never reaches this dispatch, so raising here cannot
+     * collide with the prefill pread cache; enter_prefill() shrinks it back. */
+    ds4_gpu_residency_lru_enter_gen();
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf       = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gatebuf    = ds4_gpu_tensor_buffer(gate);
+        id<MTLBuffer> upbuf      = ds4_gpu_tensor_buffer(up);
+        id<MTLBuffer> midbuf     = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf     = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> expertsbuf = ds4_gpu_tensor_buffer(experts);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf  = ds4_gpu_tensor_buffer(weights);
+        const uint64_t x_bytes   = (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+        if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !expertsbuf ||
+            !selectedbuf || !weightsbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(gate) < mid_bytes ||
+            ds4_gpu_tensor_bytes(up) < mid_bytes ||
+            ds4_gpu_tensor_bytes(mid) < mid_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes ||
+            ds4_gpu_tensor_bytes(experts) < (uint64_t)n_expert * out_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert * sizeof(float)) {
+            fprintf(stderr, "ds4: residency-lru received undersized activation buffers\n");
+            return 0;
+        }
+
+        /* Acquire (wire) the per-expert weight working set for every selected
+         * expert, then maybe-commit the residency set (batched per token). */
+        id<MTLBuffer> e_gate[6], e_up[6], e_down[6];
+        uint64_t e_gate_inner[6], e_up_inner[6], e_down_inner[6];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            const uint32_t expert = (uint32_t)selected_ids[i];
+            if (expert >= n_total_expert) return 0;
+            const uint64_t g_off = gate_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t u_off = up_offset   + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t d_off = down_offset + (uint64_t)expert * down_expert_bytes;
+            int32_t idx = ds4_residency_lru_acquire(layer, expert, model_map, model_size,
+                                                   g_off, u_off, d_off,
+                                                   gate_expert_bytes, gate_expert_bytes,
+                                                   down_expert_bytes);
+            if (idx < 0) return 0;   /* caller falls back */
+            ds4_residency_lru_entry *e = &g_residency_lru_entries[idx];
+            e_gate[i] = e->gate;       e_up[i] = e->up;       e_down[i] = e->down;
+            e_gate_inner[i] = e->gate_inner;
+            e_up_inner[i]   = e->up_inner;
+            e_down_inner[i] = e->down_inner;
+        }
+        ds4_residency_lru_commit_maybe();
+
+        const uint32_t n_tokens = 1;
+        const uint32_t pair_rows = n_tokens * n_expert;
+        const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
+        const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+
+        const NSUInteger sel_off       = ds4_gpu_tensor_offset(selected);
+        const NSUInteger x_off         = ds4_gpu_tensor_offset(x);
+        const NSUInteger gate_base_off = ds4_gpu_tensor_offset(gate);
+        const NSUInteger up_base_off   = ds4_gpu_tensor_offset(up);
+        const NSUInteger mid_base_off  = ds4_gpu_tensor_offset(mid);
+        const NSUInteger out_off       = ds4_gpu_tensor_offset(out);
+        const NSUInteger weights_off   = ds4_gpu_tensor_offset(weights);
+        const NSUInteger row_stride    = (NSUInteger)expert_mid_dim * sizeof(float);
+        const NSUInteger out_row_stride = (NSUInteger)out_dim * sizeof(float);
+
+        /*
+         * Fused slots6 fast path: each selected expert already lives in its own
+         * NoCopy buffer, which is exactly the per-slot buffer layout the streaming
+         * expert-cache slots6 kernels expect.  When there are exactly 6 experts and
+         * a matching quant pair is wired, collapse the 18 per-expert mul_mv_id
+         * dispatches + standalone swiglu + sum into two fused dispatches
+         * (gate+up+swiglu, then down+sum6) -- the same kernels the IQ2/Q2 and Q4_K
+         * pread cache use.  Otherwise fall back to the per-expert mul_mv_id loop.
+         */
+        id<MTLComputePipelineState> slots6_pair_pipeline = nil;
+        id<MTLComputePipelineState> slots6_sum6_pipeline = nil;
+        if (gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) {
+            slots6_pair_pipeline = g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline;
+            slots6_sum6_pipeline = g_moe_mul_mv_slots6_q2_k_sum6_pipeline;
+        } else if (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K) {
+            slots6_pair_pipeline = g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline;
+            slots6_sum6_pipeline = g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
+        }
+        static int slots6_env_enabled = -1;   /* per layer per token; resolve once */
+        if (slots6_env_enabled < 0) {
+            slots6_env_enabled =
+                getenv("DS4_METAL_DISABLE_RESIDENCY_LRU_SLOTS6") == NULL;
+        }
+        const bool fused_slots6 =
+            n_expert == 6 && n_tokens == 1 && !g_quality_mode &&
+            slots6_pair_pipeline != nil && slots6_sum6_pipeline != nil &&
+            slots6_env_enabled != 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = 1;
+
+        if (fused_slots6) {
+            /* Slot order == selected order: slot i is selected expert i. */
+            __unsafe_unretained id<MTLBuffer> gate_slot_bufs[6];
+            __unsafe_unretained id<MTLBuffer> up_slot_bufs[6];
+            __unsafe_unretained id<MTLBuffer> down_slot_bufs[6];
+            NSUInteger gate_slot_offsets[6];
+            NSUInteger up_slot_offsets[6];
+            NSUInteger down_slot_offsets[6];
+            for (uint32_t i = 0; i < 6; i++) {
+                gate_slot_bufs[i]    = e_gate[i];
+                up_slot_bufs[i]      = e_up[i];
+                down_slot_bufs[i]    = e_down[i];
+                gate_slot_offsets[i] = (NSUInteger)e_gate_inner[i];
+                up_slot_offsets[i]   = (NSUInteger)e_up_inner[i];
+                down_slot_offsets[i] = (NSUInteger)e_down_inner[i];
+            }
+            /* nei0 = 6 (one row per slot); down reads n_expert mid rows. */
+            ds4_gpu_mul_mv_id_args gate_args =
+                ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                              gate_row_bytes, gate_expert_bytes,
+                                              1, n_expert, n_tokens, gate_nr0);
+            ds4_gpu_mul_mv_id_args down_args =
+                ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                              down_row_bytes, down_expert_bytes,
+                                              n_expert, n_expert, n_tokens, down_nr0);
+            ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+                .width = expert_mid_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = clamp,
+            };
+            ok = ds4_gpu_encode_mul_mv_slots6_pair_swiglu(cb,
+                                                          slots6_pair_pipeline,
+                                                          &gate_args,
+                                                          &act_args,
+                                                          gate_slot_bufs, gate_slot_offsets,
+                                                          up_slot_bufs, up_slot_offsets,
+                                                          xbuf, x_off,
+                                                          gatebuf, gate_base_off,
+                                                          upbuf, up_base_off,
+                                                          midbuf, mid_base_off,
+                                                          weightsbuf, weights_off,
+                                                          gate_smem, 2, false);
+            if (ok) {
+                /* sum6 sums all 6 experts in-kernel -> straight to out, no tail sum. */
+                ok = ds4_gpu_encode_mul_mv_slots6_sum6(cb,
+                                                       slots6_sum6_pipeline,
+                                                       &down_args,
+                                                       down_slot_bufs, down_slot_offsets,
+                                                       midbuf, mid_base_off,
+                                                       outbuf, out_off,
+                                                       down_smem, 2);
+            }
+        } else {
+            /* Per-expert single-slot fallback (nei0=1, src1_expert_rows=1), nb02
+             * forced to 0 so the per-expert buffer base is used directly. */
+            ds4_gpu_mul_mv_id_args gate_args =
+                ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                              gate_row_bytes, gate_expert_bytes,
+                                              1, 1, n_tokens, gate_nr0);
+            gate_args.nb02 = 0;
+            ds4_gpu_mul_mv_id_args down_args =
+                ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                              down_row_bytes, down_expert_bytes,
+                                              1, 1, n_tokens, down_nr0);
+            down_args.nb02 = 0;
+
+            /* Gate + up: one single-slot dispatch per selected expert -> row i. */
+            for (uint32_t i = 0; ok && i < n_expert; i++) {
+                ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                                e_gate[i], (NSUInteger)e_gate_inner[i],
+                                                xbuf, x_off,
+                                                gatebuf, gate_base_off + (NSUInteger)i * row_stride,
+                                                selectedbuf, sel_off,
+                                                gate_smem, 2, false);
+                if (ok) {
+                    ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                                    e_up[i], (NSUInteger)e_up_inner[i],
+                                                    xbuf, x_off,
+                                                    upbuf, up_base_off + (NSUInteger)i * row_stride,
+                                                    selectedbuf, sel_off,
+                                                    gate_smem, 2, false);
+                }
+            }
+            /* SwiGLU + route weight over all rows (existing kernel, unchanged). */
+            if (ok) {
+                ok = ds4_gpu_encode_moe_swiglu_weight(cb,
+                                                        gatebuf, gate_base_off,
+                                                        upbuf, up_base_off,
+                                                        midbuf, mid_base_off,
+                                                        weightsbuf, weights_off,
+                                                        expert_mid_dim, pair_rows, clamp, false);
+            }
+            /* Down: one single-slot dispatch per expert, reading mid row i.  For
+             * n_expert == 1 write straight to out; otherwise per-expert rows + sum. */
+            id<MTLBuffer> down_dst    = (n_expert == 1) ? outbuf : expertsbuf;
+            NSUInteger    down_dst_base = (n_expert == 1) ? out_off
+                                                          : ds4_gpu_tensor_offset(experts);
+            for (uint32_t i = 0; ok && i < n_expert; i++) {
+                ok = ds4_gpu_encode_mul_mv_id(cb, down_mv_pipeline, &down_args,
+                                                e_down[i], (NSUInteger)e_down_inner[i],
+                                                midbuf, mid_base_off + (NSUInteger)i * row_stride,
+                                                down_dst, down_dst_base + (NSUInteger)i * out_row_stride,
+                                                selectedbuf, sel_off,
+                                                down_smem, 2, false);
+            }
+            if (ok && n_expert > 1) {
+                ok = ds4_gpu_encode_moe_sum_experts(cb,
+                                                      expertsbuf, ds4_gpu_tensor_offset(experts),
+                                                      outbuf, out_off,
+                                                      out_dim, n_expert, n_tokens);
+            }
+        }
+        if (!ok) return 0;
+
+        const double prof_t0 = g_residency_lru_profile ? ds4_gpu_now_ms() : 0.0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "routed dynamic MoE")) return 0;
+        if (g_residency_lru_profile) {
+            g_mmap_zc_prof_gpu_ms += ds4_gpu_now_ms() - prof_t0;
+            /* The benchmark harness hard-kills the server, so the teardown dump
+             * never runs.  Emit the cumulative breakdown periodically instead. */
+            if (++g_mmap_zc_prof_dispatches % 4096u == 0) {
+                ds4_gpu_residency_lru_stats_dump();
+            }
+        }
+    }
+
+    return 1;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -23289,6 +24150,24 @@ int ds4_gpu_routed_moe_one_tensor(
         id<MTLComputePipelineState> slots_sum6_pipeline =
             use_iq2_selected_slots ? g_moe_mul_mv_slots6_q2_k_sum6_pipeline :
             g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
+        /*
+         * Streaming expert-cache addr/masked pipelines selected by quant type,
+         * mirroring the slots selectors above.  The IQ2 and Q4 streaming addr
+         * kernels share an identical argument layout, so the same iq2/q2 encode
+         * helpers below drive either pipeline -- residency is bound from the
+         * cache entries (type-agnostic) and the row grid follows args->nr0
+         * (set per quant type).
+         */
+        id<MTLComputePipelineState> stream_addr_pair_pipeline =
+            use_iq2_selected_slots ? g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline :
+            g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline;
+        id<MTLComputePipelineState> stream_addr_sum6_pipeline =
+            use_iq2_selected_slots ? g_moe_mul_mv_addr_q2_k_sum6_pipeline :
+            g_moe_mul_mv_addr_q4_k_sum6_pipeline;
+        id<MTLComputePipelineState> stream_addr_pair_masked_pipeline =
+            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
+        id<MTLComputePipelineState> stream_addr_sum6_masked_pipeline =
+            g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline;
         const char *selected_profile_env = getenv("DS4_METAL_SELECTED_PROFILE");
         if (!selected_profile_env) {
             selected_profile_env = getenv("DS4_METAL_Q4_SELECTED_PROFILE");
@@ -23631,22 +24510,22 @@ int ds4_gpu_routed_moe_one_tensor(
                 ds4_gpu_stream_compact_addr_requested() &&
                 !stream_split_ready &&
                 !ds4_gpu_stream_expert_masked_addr_requested() &&
-                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
-                g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
+                stream_addr_pair_pipeline != nil &&
+                stream_addr_sum6_pipeline != nil;
             use_stream_expert_split_candidate =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
                 !use_stream_compact_addr &&
                 stream_split_ready &&
-                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
-                g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
+                stream_addr_pair_masked_pipeline != nil &&
+                stream_addr_sum6_masked_pipeline != nil;
             const bool use_stream_hit_validator =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
                 ds4_gpu_stream_expert_hit_validator_requested() &&
                 g_moe_stream_expert_cache_validate_pipeline != nil &&
-                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
-                g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
+                stream_addr_pair_pipeline != nil &&
+                stream_addr_sum6_pipeline != nil &&
                 ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
                                                          &stream_gate_addr_buf,
                                                          &stream_up_addr_buf,
@@ -23874,8 +24753,8 @@ int ds4_gpu_routed_moe_one_tensor(
                 use_stream_expert_addr_table =
                     use_iq2_selected_slots &&
                     ds4_gpu_stream_expert_addr_table_kernel_requested() &&
-                    g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
-                    g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
+                    stream_addr_pair_pipeline != nil &&
+                    stream_addr_sum6_pipeline != nil &&
                     ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
                                                              &stream_gate_addr_buf,
                                                              &stream_up_addr_buf,
@@ -23883,8 +24762,8 @@ int ds4_gpu_routed_moe_one_tensor(
                 use_stream_expert_masked_addr_table =
                     use_stream_expert_addr_table &&
                     ds4_gpu_stream_expert_masked_addr_requested() &&
-                    g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
-                    g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
+                    stream_addr_pair_masked_pipeline != nil &&
+                    stream_addr_sum6_masked_pipeline != nil;
                 use_stream_expert_split_deferred =
                     use_stream_expert_split_candidate &&
                     use_stream_expert_masked_addr_table &&
@@ -24444,7 +25323,7 @@ int ds4_gpu_routed_moe_one_tensor(
                             .accumulate = 0u,
                         };
                         ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                               g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                               stream_addr_pair_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
                                                                                &resident_pair_args,
@@ -24588,7 +25467,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         };
                         if (ok) {
                             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                                   g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                                   stream_addr_pair_masked_pipeline,
                                                                                    &gate_args,
                                                                                    &act_args,
                                                                                    &missing_pair_args,
@@ -24613,7 +25492,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         }
                         if (ok) {
                             ok = ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(cb,
-                                                                           g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
+                                                                           stream_addr_sum6_masked_pipeline,
                                                                            &down_args,
                                                                            &all_down_args,
                                                                            stream_slot_entries,
@@ -24658,7 +25537,7 @@ int ds4_gpu_routed_moe_one_tensor(
                             .accumulate = 0u,
                         };
                         ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
-                                                                               g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                                               stream_addr_pair_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
                                                                                &split_args,
@@ -24683,7 +25562,7 @@ int ds4_gpu_routed_moe_one_tensor(
                     }
                 } else {
                     ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
-                                                                    g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
+                                                                    stream_addr_pair_pipeline,
                                                                     &gate_args,
                                                                     &act_args,
                                                                     stream_slot_entries,
@@ -24997,7 +25876,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         .accumulate = 0u,
                     };
                     ok = ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(cb,
-                                                                   g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
+                                                                   stream_addr_sum6_masked_pipeline,
                                                                    &down_args,
                                                                    &split_args,
                                                                    stream_slot_entries,
@@ -25012,7 +25891,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                    2);
                 } else {
                     ok = ds4_gpu_encode_mul_mv_addr_q2_sum6(cb,
-                                                             g_moe_mul_mv_addr_q2_k_sum6_pipeline,
+                                                             stream_addr_sum6_pipeline,
                                                              &down_args,
                                                              stream_slot_entries,
                                                              n_expert,
@@ -25321,6 +26200,21 @@ int ds4_gpu_routed_moe_batch_tensor(
                     gate_type, down_type);
             return 0;
         }
+        /*
+         * Prefill streaming-cache addr pipelines selected by quant type.  The
+         * IQ2 and Q4 addr kernels share an identical argument layout (the same
+         * iq2/q2 encoders drive either), so this batch (prefill) path mirrors
+         * the decode selectors in one_tensor.
+         */
+        const bool batch_addr_q4 =
+            gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K;
+        id<MTLComputePipelineState> batch_stream_addr_pair_pipeline =
+            batch_addr_q4 ? g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline
+                          : g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
+        id<MTLComputePipelineState> batch_stream_addr_sum6_pipeline =
+            batch_addr_q4 ? g_moe_mul_mv_addr_q4_k_sum6_pipeline
+                          : g_moe_mul_mv_addr_q2_k_sum6_pipeline;
+        /* Name kept for history; now covers Q4_K too (gate decides the layout). */
         const bool use_iq2_batch_selected_addr =
             ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
                                                                n_total_expert,
@@ -25332,8 +26226,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             !g_quality_mode &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
-            g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
-            g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
+            batch_stream_addr_pair_pipeline != nil &&
+            batch_stream_addr_sum6_pipeline != nil;
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -25737,7 +26631,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             };
             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
                     cb,
-                    g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
+                    batch_stream_addr_pair_pipeline,
                     &gate_args,
                     &act_args,
                     stream_resources,
@@ -26026,7 +26920,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (use_iq2_batch_selected_addr) {
                 ok = ds4_gpu_encode_mul_mv_addr_q2_sum6(
                         cb,
-                        g_moe_mul_mv_addr_q2_k_sum6_pipeline,
+                        batch_stream_addr_sum6_pipeline,
                         &down_args,
                         stream_resources,
                         stream_resource_count,

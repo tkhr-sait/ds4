@@ -744,6 +744,165 @@ static double now_sec(void) {
 }
 
 /* =========================================================================
+ * Async F_RDADVISE prefetch pool (residency-lru gen path).
+ *
+ * The residency LRU is the hot/cold judgement -- prefetch is only issued on an
+ * LRU miss (the hot working set is already wired), so the prefetched ranges are
+ * already the cold set.  F_RDADVISE is itself a no-op on pages already in the
+ * page cache, so the real SSD I/O concentrates on genuinely cold ranges with no
+ * extra residency probe.  This pool then (a) issues the F_RDADVISE off the
+ * encode thread via DS4_PREFETCH_ASYNC_WORKERS workers, and (b) splits each miss
+ * range into DS4_PREFETCH_ASYNC_SPLIT sub-requests so a handful of cold misses
+ * still raise the SSD queue depth.  Defined unconditionally (portable pthread;
+ * F_RDADVISE is Apple-only and guarded); only invoked from the Metal path.
+ * ========================================================================= */
+#define DS4_PREFETCH_ASYNC_QUEUE_CAP 8192
+#define DS4_PREFETCH_ASYNC_MAX_WORKERS 16
+
+typedef struct { int fd; long long off; int len; } ds4_prefetch_async_job;
+
+static struct {
+    int             initialized;
+    int             stop;
+    int             workers;
+    int             split;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    pthread_t       thread[DS4_PREFETCH_ASYNC_MAX_WORKERS];
+    ds4_prefetch_async_job buf[DS4_PREFETCH_ASYNC_QUEUE_CAP];
+    int             head;
+    int             tail;
+    int             count;
+} g_prefetch_async;
+
+static void ds4_prefetch_rdadvise_issue(int fd, long long off, int len) {
+    if (fd < 0 || len <= 0) return;
+#if defined(F_RDADVISE)
+    if (off < 0) return;
+    struct radvisory ra;
+    ra.ra_offset = (off_t)off;
+    ra.ra_count  = len;
+    (void)fcntl(fd, F_RDADVISE, &ra);
+#else
+    (void)off;
+#endif
+}
+
+static void *ds4_prefetch_async_worker_fn(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_prefetch_async.mutex);
+        while (g_prefetch_async.count == 0 && !g_prefetch_async.stop) {
+            pthread_cond_wait(&g_prefetch_async.cond, &g_prefetch_async.mutex);
+        }
+        if (g_prefetch_async.count == 0 && g_prefetch_async.stop) {
+            pthread_mutex_unlock(&g_prefetch_async.mutex);
+            return NULL;
+        }
+        const ds4_prefetch_async_job job = g_prefetch_async.buf[g_prefetch_async.head];
+        g_prefetch_async.head = (g_prefetch_async.head + 1) % DS4_PREFETCH_ASYNC_QUEUE_CAP;
+        g_prefetch_async.count--;
+        pthread_mutex_unlock(&g_prefetch_async.mutex);
+        ds4_prefetch_rdadvise_issue(job.fd, job.off, job.len);
+    }
+}
+
+static int ds4_prefetch_async_env_int(const char *name, int dflt, int lo, int hi) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return dflt;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v) return dflt;
+    if (n < lo) n = lo;
+    if (n > hi) n = hi;
+    return (int)n;
+}
+
+static void ds4_prefetch_async_start(void) {
+    if (g_prefetch_async.initialized) return;
+    /* Defaults tuned for the I/O-bound (small-budget) regime: more workers and
+     * range splitting raise SSD queue depth on cold misses.  Harmless when the
+     * budget is large (95% hit -> the pool is rarely touched). */
+    g_prefetch_async.workers = ds4_prefetch_async_env_int(
+            "DS4_PREFETCH_ASYNC_WORKERS", 4, 1, DS4_PREFETCH_ASYNC_MAX_WORKERS);
+    g_prefetch_async.split = ds4_prefetch_async_env_int(
+            "DS4_PREFETCH_ASYNC_SPLIT", 4, 1, 64);
+    if (pthread_mutex_init(&g_prefetch_async.mutex, NULL) != 0) return;
+    if (pthread_cond_init(&g_prefetch_async.cond, NULL) != 0) {
+        pthread_mutex_destroy(&g_prefetch_async.mutex);
+        return;
+    }
+    g_prefetch_async.head = g_prefetch_async.tail = g_prefetch_async.count = 0;
+    g_prefetch_async.stop = 0;
+    int started = 0;
+    for (int i = 0; i < g_prefetch_async.workers; i++) {
+        if (pthread_create(&g_prefetch_async.thread[i], NULL,
+                           ds4_prefetch_async_worker_fn, NULL) == 0) {
+            started++;
+        }
+    }
+    g_prefetch_async.workers = started;   /* 0 => enqueue falls back to sync */
+    g_prefetch_async.initialized = 1;
+}
+
+static void ds4_prefetch_async_enqueue(int fd, long long off, int len) {
+    if (len <= 0) return;
+    if (!g_prefetch_async.initialized || g_prefetch_async.workers == 0) {
+        ds4_prefetch_rdadvise_issue(fd, off, len);
+        return;
+    }
+    int split = g_prefetch_async.split;
+    if (split < 1) split = 1;
+    long long chunk = (long long)len / split;
+    if (chunk <= 0) { chunk = len; split = 1; }
+    pthread_mutex_lock(&g_prefetch_async.mutex);
+    for (int i = 0; i < split; i++) {
+        const long long o = off + (long long)i * chunk;
+        const int l = (i + 1 == split)
+                          ? (int)((long long)len - (long long)i * chunk)
+                          : (int)chunk;
+        if (g_prefetch_async.count >= DS4_PREFETCH_ASYNC_QUEUE_CAP) {
+            pthread_mutex_unlock(&g_prefetch_async.mutex);
+            ds4_prefetch_rdadvise_issue(fd, o, l);  /* full -> inline, no drop */
+            pthread_mutex_lock(&g_prefetch_async.mutex);
+            continue;
+        }
+        g_prefetch_async.buf[g_prefetch_async.tail] =
+            (ds4_prefetch_async_job){ fd, o, l };
+        g_prefetch_async.tail = (g_prefetch_async.tail + 1) % DS4_PREFETCH_ASYNC_QUEUE_CAP;
+        g_prefetch_async.count++;
+    }
+    pthread_cond_broadcast(&g_prefetch_async.cond);
+    pthread_mutex_unlock(&g_prefetch_async.mutex);
+}
+
+/* Prefetch a model file range for the residency-lru gen path.  Only
+ * reached on a residency-LRU miss (the LRU is the hot/cold judgement), so it
+ * just issues the miss -- asynchronously and split for SSD queue depth.
+ * F_RDADVISE is itself a no-op on already-cached pages, so the real SSD I/O
+ * concentrates on cold ranges with no extra residency probe. */
+void ds4_prefetch_expert_range(int fd, uint64_t file_off, uint64_t len) {
+    if (fd < 0 || len == 0) return;
+    static int use_async = -1;   /* per-call on the gen miss path; resolve once */
+    if (use_async < 0) {
+        const char *async_env = getenv("DS4_PREFETCH_RDADVISE_ASYNC");
+        use_async = !(async_env && async_env[0] == '0');
+    }
+    if (use_async) ds4_prefetch_async_start();
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t rem = len - pos;
+        const int l = rem > (uint64_t)INT_MAX ? INT_MAX : (int)rem;
+        if (use_async) {
+            ds4_prefetch_async_enqueue(fd, (long long)(file_off + pos), l);
+        } else {
+            ds4_prefetch_rdadvise_issue(fd, (long long)(file_off + pos), l);
+        }
+        pos += (uint64_t)l;
+    }
+}
+
+/* =========================================================================
  * Metal Routed Expert Locality Profiler.
  * =========================================================================
  *
@@ -11550,6 +11709,141 @@ static bool metal_graph_stream_decode_layer_batch_enabled(
            getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
 }
 
+/*
+ * The Metal streaming routed-MoE kernels serve experts from the streaming
+ * expert cache for the IQ2_XXS gate/up + Q2_K down layout.  For any other expert
+ * quantization the cache is never consulted and the routed gate/up/down tensors
+ * are wrapped straight out of the mapped model views.  The decode and
+ * static-decode span maps deliberately omit routed experts (they assume the
+ * cache supplies them), so on non-cache-served models the decode path must
+ * install the *full* per-layer map instead; otherwise the routed expert ranges
+ * are "not covered by mapped model views" and prefill or decode fails.
+ */
+static bool metal_graph_stream_experts_served_by_cache(
+        const ds4_weights   *weights) {
+    if (!weights || DS4_N_LAYER == 0 || DS4_N_EXPERT_USED != 6) return false;
+    const ds4_layer_weights *l0 = &weights->layer[0];
+    if (!l0->ffn_gate_exps || !l0->ffn_up_exps || !l0->ffn_down_exps) return false;
+    if (ds4_gpu_stream_expert_cache_configured_count() == 0) return false;
+
+    if (l0->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l0->ffn_up_exps->type   == DS4_TENSOR_IQ2_XXS &&
+        l0->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+        return true;
+    }
+
+    /* Q4_K is also served by the streaming expert cache via the upstream
+     * "Fix Flash Q4 SSD streaming selected experts" path (use_q4_selected_slots
+     * + use_stream_expert_cache in ds4_gpu_routed_moe_one_tensor).  Keeping the
+     * routed experts out of the decode map and letting the cache supply them
+     * matches the IQ2/Q2 default, so Q4_K is cache-served too (unless routed
+     * dynamic is opted in, which sets the cache budget to 0). */
+    if (l0->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        l0->ffn_up_exps->type   == DS4_TENSOR_Q4_K &&
+        l0->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * residency-lru: an opt-in (env DS4_METAL_ENABLE_STREAMING_RESIDENCY_LRU)
+ * SSD-streaming gen path that serves the routed experts from a per-expert LRU
+ * residency set (zero-copy mmap views wired into a dedicated MTLResidencySet,
+ * bounded by a byte budget) instead of the pread expert cache or the full
+ * per-layer map.  Hot experts stay GPU-resident across tokens, so Q4_K decode
+ * stops re-faulting the whole layer every token.  Quant-agnostic at the memory
+ * level; supported where the routed mul_mv_id kernels exist (IQ2_XXS gate/up +
+ * Q2_K down, or Q4_K).  When active, the routed experts are kept OUT of the
+ * model map (decode-only map) and ds4_gpu_routed_moe_one_tensor_residency_lru supplies
+ * them.  See ds4_gpu_routed_moe_one_tensor_residency_lru() in ds4_metal.m.
+ */
+static bool metal_graph_residency_lru_quant_q4(uint32_t gate_type,
+                                                uint32_t up_type,
+                                                uint32_t down_type) {
+    return gate_type == DS4_TENSOR_Q4_K &&
+           up_type   == DS4_TENSOR_Q4_K &&
+           down_type == DS4_TENSOR_Q4_K;
+}
+
+static bool metal_graph_residency_lru_quant_supported(uint32_t gate_type,
+                                                       uint32_t up_type,
+                                                       uint32_t down_type) {
+    return (gate_type == DS4_TENSOR_IQ2_XXS &&
+            up_type   == DS4_TENSOR_IQ2_XXS &&
+            down_type == DS4_TENSOR_Q2_K) ||
+           metal_graph_residency_lru_quant_q4(gate_type, up_type, down_type);
+}
+
+/*
+ * The ds4_gpu_graph-independent half of the residency-lru decision:
+ * n_expert_used + quant eligibility + the enable/disable envs (NOT the
+ * --ssd-streaming gate, which each caller adds).  Factored out so ds4_engine_open()
+ * -- which has no ds4_gpu_graph, that lives per-session -- and the graph predicate
+ * below share ONE source of truth for "is dyn requested", the way the pread cache
+ * shares its budget through ds4_gpu_stream_expert_cache_configured_count() instead
+ * of recomputing "cache active" in two places.
+ *
+ * residency-lru is OPT-IN (DS4_METAL_ENABLE_STREAMING_RESIDENCY_LRU) for
+ * both Q4_K and IQ2_XXS/Q2_K.  By DEFAULT both layouts use the pread streaming
+ * expert cache instead -- Q4_K via the upstream use_q4_selected_slots +
+ * use_stream_expert_cache path (see metal_graph_stream_experts_served_by_cache),
+ * matching the established IQ2/Q2 behaviour.
+ * DS4_METAL_DISABLE_STREAMING_RESIDENCY_LRU force-disables even with the enable
+ * env set.  n_expert_used must be 6 (the slots/dispatch assumption).
+ */
+static bool metal_graph_residency_lru_requested(uint32_t gate_type,
+                                                 uint32_t up_type,
+                                                 uint32_t down_type) {
+    /* Called per layer per token via metal_graph_residency_lru_enabled(); the
+     * env pair cannot change mid-process, so resolve it once. */
+    static int env_enabled = -1;
+    if (env_enabled < 0) {
+        env_enabled =
+            getenv("DS4_METAL_DISABLE_STREAMING_RESIDENCY_LRU") == NULL &&
+            getenv("DS4_METAL_ENABLE_STREAMING_RESIDENCY_LRU") != NULL;
+    }
+    if (!env_enabled || DS4_N_EXPERT_USED != 6) return false;
+    return metal_graph_residency_lru_quant_supported(gate_type, up_type, down_type);
+}
+
+static bool metal_graph_residency_lru_enabled(const ds4_gpu_graph *g,
+                                               uint32_t gate_type,
+                                               uint32_t up_type,
+                                               uint32_t down_type) {
+    return g && g->ssd_streaming &&
+           metal_graph_residency_lru_requested(gate_type, up_type, down_type);
+}
+
+static bool metal_graph_streaming_residency_lru_active(
+        const ds4_gpu_graph *g,
+        const ds4_weights   *weights) {
+    if (!weights || DS4_N_LAYER == 0 ||
+        !weights->layer[0].ffn_gate_exps ||
+        !weights->layer[0].ffn_up_exps ||
+        !weights->layer[0].ffn_down_exps) {
+        return false;
+    }
+    return metal_graph_residency_lru_enabled(
+            g,
+            weights->layer[0].ffn_gate_exps->type,
+            weights->layer[0].ffn_up_exps->type,
+            weights->layer[0].ffn_down_exps->type);
+}
+
+/*
+ * With residency-lru the static-decode map holds ONLY the non-routed
+ * weights (~8 GiB; routed experts stream via the residency LRU).  That bounded
+ * set is safe to pin once via requestResidency, so the non-routed weights are
+ * not re-managed by Metal automatic residency on every per-layer command buffer
+ * -- matching the cpu-moe design.  Default on; disable to fall back to the
+ * mmap/auto-residency behaviour.
+ */
+static bool metal_graph_streaming_static_residency_enabled(void) {
+    return getenv("DS4_METAL_DISABLE_STREAMING_STATIC_RESIDENCY") == NULL;
+}
+
 static void metal_graph_stream_readahead_range_impl(
         const ds4_model *model,
         uint64_t         offset,
@@ -11643,6 +11937,56 @@ static bool metal_graph_stream_madvise_willneed_range_impl(
     (void)size;
     (void)advised;
     return true;
+#endif
+}
+
+/* Drop a finished prefill layer's routed expert pages (gate/up/down exps) so
+ * the full-map layer sweep reclaims its OWN pages instead of evicting the gen
+ * working set from the page cache.  POSIX_MADV_DONTNEED on clean file-backed
+ * mmap pages = advisory drop; a straggling in-flight read just re-faults the
+ * same bytes, so this is residency-only (numerics unaffected).  Same primitive
+ * as ds4_gpu_stream_expert_evict_dontneed_range in ds4_metal.m. */
+static void metal_graph_stream_prefill_layer_routed_dontneed(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+#if defined(POSIX_MADV_DONTNEED)
+    if (!model || !model->map || !weights || il >= DS4_N_LAYER) return;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    const ds4_tensor *tensors[3] = {
+        layer->ffn_gate_exps,
+        layer->ffn_up_exps,
+        layer->ffn_down_exps,
+    };
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page == 0) return;
+    for (int i = 0; i < 3; i++) {
+        const ds4_tensor *t = tensors[i];
+        if (!t || t->bytes == 0 ||
+            t->abs_offset > model->size ||
+            t->bytes > model->size - t->abs_offset) {
+            continue;
+        }
+        const uint64_t page_offset = t->abs_offset & ~(page - 1u);
+        const uint64_t leading = t->abs_offset - page_offset;
+        if (t->bytes > UINT64_MAX - leading ||
+            leading + t->bytes > UINT64_MAX - (page - 1u)) {
+            continue;
+        }
+        uint64_t advise_bytes = align_up(leading + t->bytes, page);
+        if (advise_bytes > model->size - page_offset) {
+            advise_bytes = model->size - page_offset;
+        }
+        if (advise_bytes == 0 || advise_bytes > (uint64_t)SIZE_MAX) continue;
+        uint8_t *base = (uint8_t *)model->map;
+        (void)posix_madvise((void *)(base + page_offset),
+                            (size_t)advise_bytes,
+                            POSIX_MADV_DONTNEED);
+    }
+#else
+    (void)model;
+    (void)weights;
+    (void)il;
 #endif
 }
 
@@ -11811,10 +12155,18 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
-        DS4_N_EXPERT_USED != 6 ||
-        weights->layer[0].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-        weights->layer[0].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-        weights->layer[0].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
+        DS4_N_EXPERT_USED != 6) {
+        return false;
+    }
+
+    /* IQ2_XXS/Q2_K only -- the streaming addr kernels are batch-capable (the addr
+     * kernel iterates nei1 tokens). */
+    const ds4_layer_weights *l0 = &weights->layer[0];
+    const bool iq2_layout =
+        l0->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l0->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l0->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    if (!iq2_layout) {
         return false;
     }
 
@@ -14018,6 +14370,17 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
 #endif
 }
 
+/*
+ * True for any routed-MoE layer whose experts are served by the streaming expert
+ * cache at decode time: IQ2_XXS/Q2_K.  Used by the hotlist/prefill cache seeders
+ * (the seed copy itself is type-agnostic).
+ */
+static bool metal_graph_decode_cache_served_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    return metal_graph_decode_iq2_selected_slots_expected(g, layer);
+}
+
 static uint32_t metal_graph_streaming_prefill_cache_seed_k(const ds4_gpu_graph *g) {
     if (!g ||
         !g->ssd_streaming ||
@@ -15805,6 +16168,72 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    /*
+     * residency-lru: compute this gen step's routed MoE by wiring only
+     * the router-selected experts into the per-expert LRU residency set.  The
+     * dynamic manager needs the selected ids on the host.  Preferred path: ride
+     * the overlap_selected_shared branch below -- signal the shared event after
+     * the router select, encode the shared-expert compute, commit WITHOUT a
+     * full drain, wait only the event, then read the ids and encode the
+     * per-expert GEMV (so the GPU crunches the shared expert while the CPU
+     * acquires/wires the experts, and LRU-miss rdadvise gains that lead time).
+     * Fallback (stage-profile / cpu-router / tid2eid / replay runs): flush the
+     * router select with a full sync, read, resume recording, encode here.  It
+     * fills g->routed_out; residency_lru_done then forces the simple default
+     * branch below and skips its routed-MoE call (the shared expert + HC post
+     * still run).  When active the routed experts are not in the model map, so
+     * a failure is fatal for this token rather than a silent (impossible) wrap.
+     */
+    bool residency_lru_done = false;
+    const bool residency_lru =
+        ok && metal_graph_residency_lru_enabled(g,
+                                                 layer->ffn_gate_exps->type,
+                                                 layer->ffn_up_exps->type,
+                                                 layer->ffn_down_exps->type);
+    const bool residency_lru_overlap =
+        residency_lru &&
+        !decode_stage_profile &&
+        !metal_graph_decode_cpu_router_applicable(g, layer) &&
+        layer->ffn_gate_tid2eid == NULL &&
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+    if (residency_lru && !residency_lru_overlap) {
+        int32_t residency_lru_sel[DS4_MAX_EXPERT_USED];
+        ok = (ds4_gpu_end_commands() != 0);
+        if (ok) ok = ds4_gpu_tensor_read(g->router_selected, 0, residency_lru_sel,
+                                         (uint64_t)DS4_N_EXPERT_USED *
+                                         sizeof(residency_lru_sel[0])) != 0;
+        if (ok) ok = (ds4_gpu_begin_commands() != 0);
+        if (ok) {
+            residency_lru_done = ds4_gpu_routed_moe_one_tensor_residency_lru(
+                                  g->routed_out,
+                                  g->routed_gate,
+                                  g->routed_up,
+                                  g->routed_mid,
+                                  g->routed_down,
+                                  model->map, model->size,
+                                  layer->ffn_gate_exps->abs_offset,
+                                  layer->ffn_up_exps->abs_offset,
+                                  layer->ffn_down_exps->abs_offset,
+                                  layer->ffn_gate_exps->type,
+                                  layer->ffn_down_exps->type,
+                                  gate_expert_bytes, gate_row_bytes,
+                                  down_expert_bytes, down_row_bytes,
+                                  (uint32_t)expert_in_dim,
+                                  (uint32_t)down_in_dim,
+                                  (uint32_t)routed_out_dim,
+                                  g->router_selected, g->router_weights,
+                                  DS4_N_EXPERT,
+                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                  residency_lru_sel, il) != 0;
+        }
+        if (ok && !residency_lru_done) {
+            fprintf(stderr,
+                    "ds4: residency-lru failed at layer %u; aborting decode\n",
+                    il);
+            ok = false;
+        }
+        if (!ok) return false;
+    }
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
 #ifdef DS4_ROCM_BUILD
     const bool fuse_shared_gate_up = !g->quality;
@@ -15829,27 +16258,31 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_decode_cuda_selected_slots_expected(g, layer);
     const bool overlap_selected_shared =
         ok &&
+        !residency_lru_done &&
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
-        (q4_selected_shared_overlap ||
+        (residency_lru_overlap ||
+         q4_selected_shared_overlap ||
          iq2_selected_shared_overlap ||
          cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
-        ((iq2_selected_shared_overlap &&
+        ((!residency_lru_overlap &&
+          iq2_selected_shared_overlap &&
           metal_graph_use_iq2_selected_async_load(g)) ||
          cuda_selected_shared_overlap);
     const bool selected_readahead_shared_delay =
         ok &&
+        !residency_lru_done &&
         !overlap_selected_shared &&
         !decode_stage_profile &&
-        metal_graph_use_iq2_selected_readahead_shared_delay(g) &&
-        metal_graph_decode_iq2_selected_slots_expected(g, layer) &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
-        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL;
+        getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
+        (metal_graph_use_iq2_selected_readahead_shared_delay(g) &&
+         metal_graph_decode_iq2_selected_slots_expected(g, layer));
     const bool cuda_stream_selected_load =
         ok &&
         !overlap_selected_shared &&
@@ -16057,23 +16490,58 @@ static bool metal_graph_encode_decode_layer(
             ok = ds4_gpu_tensor_read(g->router_selected,
                                      0,
                                      selected_ids,
-                                     (uint64_t)DS4_N_EXPERT_USED * sizeof(selected_ids[0])) != 0 &&
-                 ds4_gpu_routed_moe_set_selected_override(selected_ids,
-                                                          DS4_N_EXPERT_USED) != 0;
-            if (ok) {
-                const ds4_gpu_stream_expert_table table =
-                    graph_stream_expert_table_make(model,
-                                                   layer,
-                                                   il,
-                                                   gate_expert_bytes,
-                                                   down_expert_bytes);
-                ok = ds4_gpu_stream_expert_cache_begin_selected_load(
-                            &table,
-                            selected_ids,
-                            DS4_N_EXPERT_USED) != 0;
+                                     (uint64_t)DS4_N_EXPERT_USED * sizeof(selected_ids[0])) != 0;
+            if (ok && residency_lru_overlap) {
+                /* dyn: the host ids drive the residency acquire directly; the
+                 * pread-cache override/loader below do not apply (the streaming
+                 * expert cache budget is 0 under residency-lru). */
+                residency_lru_done = ds4_gpu_routed_moe_one_tensor_residency_lru(
+                                      g->routed_out,
+                                      g->routed_gate,
+                                      g->routed_up,
+                                      g->routed_mid,
+                                      g->routed_down,
+                                      model->map, model->size,
+                                      layer->ffn_gate_exps->abs_offset,
+                                      layer->ffn_up_exps->abs_offset,
+                                      layer->ffn_down_exps->abs_offset,
+                                      layer->ffn_gate_exps->type,
+                                      layer->ffn_down_exps->type,
+                                      gate_expert_bytes, gate_row_bytes,
+                                      down_expert_bytes, down_row_bytes,
+                                      (uint32_t)expert_in_dim,
+                                      (uint32_t)down_in_dim,
+                                      (uint32_t)routed_out_dim,
+                                      g->router_selected, g->router_weights,
+                                      DS4_N_EXPERT,
+                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                      selected_ids, il) != 0;
+                if (!residency_lru_done) {
+                    fprintf(stderr,
+                            "ds4: residency-lru failed at layer %u; aborting decode\n",
+                            il);
+                    ok = false;
+                }
+            } else if (ok) {
+                ok = ds4_gpu_routed_moe_set_selected_override(selected_ids,
+                                                              DS4_N_EXPERT_USED) != 0;
+                if (ok) {
+                    /* upstream refactor: begin_selected_load takes a prebuilt
+                     * stream-expert table (model/offsets/sizes folded in). */
+                    const ds4_gpu_stream_expert_table table =
+                        graph_stream_expert_table_make(model,
+                                                       layer,
+                                                       il,
+                                                       gate_expert_bytes,
+                                                       down_expert_bytes);
+                    ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                                &table,
+                                selected_ids,
+                                DS4_N_EXPERT_USED) != 0;
+                }
             }
         }
-        if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+        if (ok && !residency_lru_done) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                      g->routed_gate,
                                                      g->routed_up,
                                                      g->routed_mid,
@@ -16157,7 +16625,7 @@ static bool metal_graph_encode_decode_layer(
         }
         return ok;
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && !residency_lru_done) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -19513,23 +19981,68 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
+    /*
+     * Models whose routed experts are not served by the streaming expert cache
+     * (e.g. Q4_K experts) must keep the routed gate/up/down tensors in the
+     * mapped model views, so the static-decode and decode-only span maps -- both
+     * of which omit routed experts -- cannot be used.  Install the full per-layer
+     * map for those models instead.
+     */
+    /*
+     * residency-lru keeps the routed experts out of the model map and
+     * supplies them from the per-expert residency LRU (like the cache path), so
+     * the static-decode map still applies: the non-routed weights stay mapped
+     * once and only the experts stream, matching the cpu-moe design.  The one
+     * incompatibility is the single-command-buffer layer *batch*: the dynamic
+     * dispatch splits the command buffer mid-layer to read the selected ids, so
+     * force the per-layer (non-batch) encode while keeping the static map.
+     */
+    const bool residency_lru =
+        metal_graph_streaming_residency_lru_active(g, weights);
+    const bool experts_in_map =
+        !residency_lru && !metal_graph_stream_experts_served_by_cache(weights);
+    const bool static_decode_map =
+        !experts_in_map && metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
     const bool batch_static_decode =
-        static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
+        static_decode_map && !residency_lru &&
+        metal_graph_stream_decode_layer_batch_enabled(g);
     bool ok = true;
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
             ok = metal_graph_stream_map_decode_static_all(model, weights);
             if (ok) g->streaming_static_decode_map_current = static_map_state_cache;
+            /*
+             * residency-lru: the just-installed static-decode map is non-routed
+             * only, so pin it once (matching cpu-moe).  Only on (re)install so we
+             * do not rebuild the residency set every cached-map token.
+             */
+            if (ok && residency_lru &&
+                metal_graph_streaming_static_residency_enabled()) {
+                ds4_gpu_request_model_residency();
+            }
+            /*
+             * The pread cache is prefill-only under residency-lru; a (re)install
+             * means a prefill just ran, so free its slab buffers (the
+             * (1+ahead)-layer double buffer) -- gen never reads them, and the
+             * RAM is worth more as OS page cache for the LRU misses.  They
+             * re-allocate lazily at the next layer-major prefill.
+             */
+            if (ok && residency_lru) {
+                ds4_gpu_stream_expert_cache_release();
+            }
         }
     } else {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(model, weights);
     }
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
-        metal_graph_stream_readahead_layer_decode(model, weights, 0);
+        if (experts_in_map) {
+            metal_graph_stream_readahead_layer(model, weights, 0);
+        } else {
+            metal_graph_stream_readahead_layer_decode(model, weights, 0);
+        }
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
@@ -19596,12 +20109,21 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     double execute_s = 0.0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double tl0 = profile ? now_sec() : 0.0;
-        if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
-            ok = false;
-            break;
+        if (!static_decode_map) {
+            const bool map_ok = experts_in_map ?
+                metal_graph_stream_map_layer(model, weights, il) :
+                metal_graph_stream_map_layer_decode(model, weights, il);
+            if (!map_ok) {
+                ok = false;
+                break;
+            }
         }
         if (!static_decode_map && il + 1 < DS4_N_LAYER) {
-            metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
+            if (experts_in_map) {
+                metal_graph_stream_readahead_layer(model, weights, il + 1);
+            } else {
+                metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
+            }
         } else if (!static_decode_map && logits) {
             metal_graph_stream_readahead_output(model, weights);
         }
@@ -19633,6 +20155,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             execute_s += tl_done - tl_encoded;
         }
     }
+
+    /* Batched requestResidency: the per-layer dispatch deferred the residency
+     * commit; flush it once here so this token's newly wired experts persist for
+     * the next token's hits (one commit/token instead of one/layer). */
+    if (ok && residency_lru) ds4_gpu_residency_lru_commit_pending();
 
     if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
     const double t_head0 = profile ? now_sec() : 0.0;
@@ -19759,7 +20286,20 @@ static bool metal_graph_use_streaming_decode_prefill(
            !g->quality &&
            n_tokens != 0 &&
            max_tokens != 0 &&
-           n_tokens <= max_tokens;
+           n_tokens <= max_tokens &&
+           /*
+            * The decode-style prefill maps each layer without its routed
+            * experts and leans on something else to supply them.  That works
+            * when either the streaming expert cache serves them (IQ2_XXS/Q2_K
+            * and Q4_K, both cache-served by default) OR residency-lru is
+            * active (opt-in)
+            * (experts come from the per-expert residency LRU).  Either way the
+            * short prompt avoids the per-layer full-map swaps of layer-major
+            * prefill, which dominate when the small compute cannot hide them.
+            * For other cases fall back to layer-major (full per-layer map).
+            */
+           (metal_graph_stream_experts_served_by_cache(weights) ||
+            metal_graph_streaming_residency_lru_active(g, weights));
 }
 
 static bool metal_graph_use_streaming_decode_prefill_range(
@@ -19922,7 +20462,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
     uint32_t seeded_rows = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_cache_served_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -19974,7 +20514,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     uint32_t cache_budget = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_cache_served_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -20047,7 +20587,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         const uint32_t n = counts[il];
         if (n == 0) continue;
         const ds4_layer_weights *layer = &weights->layer[il];
-        if (!metal_graph_decode_iq2_selected_slots_expected(g, layer)) continue;
+        if (!metal_graph_decode_cache_served_slots_expected(g, layer)) continue;
 
         const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
         const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
@@ -20535,6 +21075,16 @@ static bool metal_graph_prefill_layer_major(
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
 
+    /* Layer-major prefill (re-)claims the residency-lru pread cache, so drop the
+     * residency LRU back to the reduced budget first -- otherwise a gen-warmed
+     * full LRU plus the pread cache slab would exceed the shared RAM bound.
+     * No-op unless dynamic budget switching is enabled.  (The decode-streaming
+     * prefill path serves experts from the LRU directly and never allocates the
+     * pread cache, so it deliberately leaves the budget alone.) */
+    if (g->ssd_streaming) {
+        ds4_gpu_residency_lru_enter_prefill();
+    }
+
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
@@ -20650,6 +21200,22 @@ static bool metal_graph_prefill_layer_major(
     }
 
     if (g->ssd_streaming) {
+        /*
+         * residency-lru: a layer-major prefill streams the model past
+         * the wired expert LRU -- the OS drops the wired pages while the LRU
+         * keeps "hitting" them, so post-prefill gen would demand-fault the
+         * stale set serially (the hit path never prefetches; observed as
+         * near-idle disk + GPU ~30%).  Drop the whole set up front instead:
+         * the prefill gets the wired RAM back, and gen restarts with every
+         * expert a MISS, which flows through the async rdadvise prefetch
+         * (parallel SSD refill) and re-wires a demand-driven set that matches
+         * physical reality.  Decode-style short prefills (<= the decode-prefill
+         * token cap) never reach this function, so mid-conversation tool-call
+         * prefills keep the hot set.
+         */
+        if (metal_graph_streaming_residency_lru_active(g, weights)) {
+            ds4_gpu_residency_lru_clear();
+        }
         g->streaming_static_decode_map_current = false;
         if (!metal_graph_stream_map_token(model, weights)) return false;
     }
@@ -20681,6 +21247,20 @@ static bool metal_graph_prefill_layer_major(
     rocm_graph_stream_layer_expert_load rocm_full_layer_load;
     memset(&rocm_full_layer_load, 0, sizeof(rocm_full_layer_load));
 #endif
+    /*
+     * residency-lru: the full-map prefill sweeps the whole model through
+     * the page cache (file-backed grows to 70+ GiB), evicting the gen working
+     * set whose page-cache hits are what keeps gen misses cheap.  Each layer's
+     * routed experts are read exactly once per chunk, so drop their pages with
+     * POSIX_MADV_DONTNEED two layers behind the encode front (same primitive as
+     * the cache evict advise): the next layer's faults then reclaim THOSE pages
+     * instead of the gen set, bounding the sweep's cache footprint to ~2-3
+     * layers.  Advisory + clean file-backed pages -> a straggling in-flight
+     * read just re-faults, so correctness is unaffected.
+     */
+    const bool routed_dontneed =
+        g->ssd_streaming &&
+        metal_graph_streaming_residency_lru_active(g, weights);
     if (g->ssd_streaming && DS4_N_LAYER > 0) {
         if (layer_prepare) {
             if (!metal_graph_stream_prepare_start_if_needed(g,
@@ -20753,6 +21333,12 @@ static bool metal_graph_prefill_layer_major(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
+        /* Two layers of slack behind the encode front: layer il-2's command
+         * buffer has had a full layer of GPU time to drain, so its routed
+         * pages are done (and a straggler would just re-fault). */
+        if (routed_dontneed && il >= 2) {
+            metal_graph_stream_prefill_layer_routed_dontneed(model, weights, il - 2u);
+        }
         if (layer_prepare &&
             !metal_graph_stream_prepare_join_layer(g,
                                                    model,
@@ -21047,11 +21633,24 @@ static bool metal_graph_prefill_layer_major(
     (void)ds4_gpu_stream_expert_cache_release_layer_cache();
     if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
 #endif
-    if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
-        return false;
-    }
-    if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
-        return false;
+    /* Under residency-lru the pread cache is prefill-only (gen serves
+     * experts from the residency LRU), so seeding it for decode hits would be
+     * wasted copies -- skip the seeders, and free the slab buffers RIGHT HERE,
+     * per chunk: the prefill tail (output head + logits) spikes wired before
+     * the chunk loop's end-of-prompt release would run, and live slabs there
+     * get COMPRESSED instead of freed (observed: anon 17->1.1 GiB with
+     * compressor +13.5 GiB at the tail; the hostage then lingers all gen).
+     * The next chunk lazily re-allocates them -- two allocations per long
+     * prefill, negligible. */
+    if (!metal_graph_streaming_residency_lru_active(g, weights)) {
+        if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
+            return false;
+        }
+        if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
+            return false;
+        }
+    } else {
+        ds4_gpu_stream_expert_cache_release();
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -21292,6 +21891,21 @@ static bool metal_graph_prefill_chunked_range(
         pos0 = chunk_end;
     }
     if (show_progress) fputc('\n', stderr);
+    /*
+     * residency-lru: free the prefill pread cache slabs (~13 GiB of
+     * anonymous Shared buffers) HERE, before gen's residency-LRU rebuild
+     * creates memory pressure -- left allocated, the OS compresses them
+     * (observed: anon 18->2.4 GiB with compressor 7->20 GiB right at prefill
+     * end) and they linger in the compressor through gen.  The gen-resume
+     * hook stays as an idempotent backstop.
+     */
+    if (g->ssd_streaming &&
+        metal_graph_streaming_residency_lru_active(g, weights)) {
+        ds4_gpu_stream_expert_cache_release();
+        /* The pread cache RAM is now free -- let the gen residency-LRU grow into
+         * the full ssd-streaming budget (shrunk back at the next prefill). */
+        ds4_gpu_residency_lru_enter_gen();
+    }
     /* nommap: free the routed prefill double-buffer (owned whole-layer expert
      * tensors + residency set) before gen so that RAM is not left wired idle
      * through decode -- gen reads experts via the streaming cache, not these
@@ -22071,6 +22685,8 @@ struct ds4_engine {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool ssd_streaming_residency_lru; /* residency-lru active -> experts via LRU, pread cache prefill-only */
+    uint32_t ssd_streaming_residency_lru_prefill_cache; /* prefill pread cache experts ((1+ahead) layers) */
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
@@ -25989,6 +26605,45 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        /* Startup status: residency-lru is opt-in (DS4_METAL_ENABLE_
+         * STREAMING_RESIDENCY_LRU) for both Q4_K and IQ2/Q2; by default both stay
+         * on the pread streaming expert cache.  Decide this BEFORE the auto cache
+         * budget below so its log reports the residency-budget basis (when opted
+         * in) rather than a cache that is then disabled.  Uses the shared
+         * metal_graph_residency_lru_requested() so this and the graph-side
+         * predicate metal_graph_residency_lru_enabled() cannot drift apart. */
+        e->ssd_streaming_residency_lru = false;
+        if (e->ssd_streaming &&
+            getenv("DS4_METAL_DISABLE_STREAMING_RESIDENCY_LRU") == NULL) {
+            const ds4_layer_weights *l0 = DS4_N_LAYER > 0 ? &e->weights.layer[0] : NULL;
+            const unsigned gt = (l0 && l0->ffn_gate_exps) ? (unsigned)l0->ffn_gate_exps->type : 9999u;
+            const unsigned ut = (l0 && l0->ffn_up_exps)   ? (unsigned)l0->ffn_up_exps->type   : 9999u;
+            const unsigned dt = (l0 && l0->ffn_down_exps) ? (unsigned)l0->ffn_down_exps->type : 9999u;
+            const bool env_enable =
+                getenv("DS4_METAL_ENABLE_STREAMING_RESIDENCY_LRU") != NULL;
+            /* Single source of truth shared with the graph predicate
+             * metal_graph_residency_lru_enabled() (it just adds the
+             * --ssd-streaming gate, already true in this branch). */
+            const bool active = metal_graph_residency_lru_requested(gt, ut, dt);
+            if (active) {
+                fprintf(stderr,
+                        "ds4: residency-lru ON (env, n_expert_used=%u, routed type=%u/%u/%u)\n",
+                        (unsigned)DS4_N_EXPERT_USED, gt, ut, dt);
+            } else if (env_enable) {
+                fprintf(stderr,
+                        "ds4: residency-lru requested but INACTIVE: n_expert_used=%u (need 6), "
+                        "routed type=%u/%u/%u (need Q4_K=%d all, or IQ2_XXS=%d/IQ2_XXS/Q2_K=%d)\n",
+                        (unsigned)DS4_N_EXPERT_USED, gt, ut, dt,
+                        DS4_TENSOR_Q4_K, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K);
+            }
+            /* residency-lru (opt-in) serves the routed experts from the
+             * per-expert residency LRU, so when active the pread expert cache must
+             * be off: leaving it on would mlock a second full copy of the experts
+             * next to the LRU and force swap.  By DEFAULT dyn is off and both Q4_K
+             * and IQ2/Q2 use the pread streaming expert cache.  One flag drives the
+             * cache-budget choice and the auto-budget log wording. */
+            e->ssd_streaming_residency_lru = active;
+        }
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -26028,7 +26683,72 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
             }
         }
+        if (e->ssd_streaming_residency_lru) {
+            /* PREFILL-ONLY pread cache: (1 + prepare_ahead) layers of experts
+             * (default = double buffer) so the layer-major prefill loads layer
+             * L+1 via the pread pool while L computes.  Gen never consults the
+             * cache (the dyn arm intercepts before ds4_gpu_routed_moe_one_tensor
+             * and the seeders are skipped under dyn), so this budget is purely
+             * the prefill working set; it is subtracted from the residency-LRU
+             * budget below so the total resident bytes stay the same.  NOTE:
+             * upstream's slab size-class pin + boosted-layer detection above runs
+             * first (unconditionally under ssd_streaming) so the prefill pread
+             * cache freezes on the correct (first-routed-layer) class. */
+            uint32_t prefill_cache =
+                (1u + metal_graph_stream_prefill_layer_prepare_ahead()) *
+                (uint32_t)DS4_N_EXPERT;
+            if (prefill_cache > e->ssd_streaming_cache_experts) {
+                prefill_cache = e->ssd_streaming_cache_experts;
+            }
+            ds4_gpu_set_streaming_expert_cache_budget(prefill_cache);
+            e->ssd_streaming_residency_lru_prefill_cache = prefill_cache;
+        } else {
+            ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        }
+        /* Size the residency-lru residency LRU to the auto ssd-streaming
+         * budget minus the prefill pread cache share, so LRU + prefill cache
+         * together fit the same RAM bound.  Env DS4_ROUTED_METAL_BUDGET_MIB
+         * overrides (it wins inside ds4_residency_lru_init). */
+        {
+            uint64_t residency_lru_per_expert = 0;
+            if (e->ssd_streaming_cache_experts != 0 &&
+                ds4_streaming_routed_expert_bytes(&e->weights, &residency_lru_per_expert) &&
+                residency_lru_per_expert != 0) {
+                uint32_t lru_experts = e->ssd_streaming_cache_experts;
+                if (lru_experts > e->ssd_streaming_residency_lru_prefill_cache) {
+                    lru_experts -= e->ssd_streaming_residency_lru_prefill_cache;
+                }
+                ds4_gpu_set_residency_lru_budget_bytes(
+                        (uint64_t)lru_experts * residency_lru_per_expert);
+                /* The prefill pread cache slab is freed at end-of-prompt before
+                 * gen, so during gen the LRU can use the full budget.  Supply it
+                 * to enable dynamic prefill/gen budget switching -- but only when
+                 * DS4_ROUTED_METAL_BUDGET_MIB is unset (an explicit override owns
+                 * the budget and must not be second-guessed per phase). */
+                if (getenv("DS4_ROUTED_METAL_BUDGET_MIB") == NULL) {
+                    ds4_gpu_set_residency_lru_gen_budget_bytes(
+                            (uint64_t)e->ssd_streaming_cache_experts *
+                            residency_lru_per_expert);
+                }
+            }
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
+#if defined(F_NOCACHE)
+        /* Prefill reads must not churn the unified buffer cache (a full layer
+         * sweep evicts the gen working set's pages).  Give the pread pool its
+         * own fd with F_NOCACHE -- a dup would share the fileglob (and its
+         * cache flag), so re-open the model by path. */
+        if (e->ssd_streaming_residency_lru) {
+            const int nocache_fd = open(opt->model_path, O_RDONLY);
+            if (nocache_fd >= 0) {
+                (void)fcntl(nocache_fd, F_NOCACHE, 1);
+                (void)ds4_gpu_set_model_nocache_fd(nocache_fd);
+                fprintf(stderr,
+                        "ds4: residency-lru prefill pread cache: %u experts, F_NOCACHE on\n",
+                        e->ssd_streaming_residency_lru_prefill_cache);
+            }
+        }
+#endif
         /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: open a dedicated page-cache-bypassing fd and hand it
          * to the Metal TU.  The owned PERSIST tier preads non-routed tensors
          * through it (F_NOCACHE/O_DIRECT); failure here is fatal because without

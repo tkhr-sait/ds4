@@ -2806,6 +2806,11 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return cuda_stream_expert_cache_configured_budget();
 }
 
+extern "C" void ds4_gpu_streaming_cache_hits_misses(uint64_t *hits, uint64_t *misses) {
+    if (hits)   *hits   = 0;
+    if (misses) *misses = 0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache.count;
 }
