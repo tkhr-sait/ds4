@@ -376,6 +376,7 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
+static void ds4_gpu_stream_nommap_routed_free(void);   /* DS4_METAL_ENABLE_STREAMING_NO_MMAP prefill routed tier */
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
@@ -7652,6 +7653,8 @@ void ds4_gpu_cleanup(void) {
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
+        ds4_gpu_stream_nommap_persist_clear();   /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned non-routed tier */
+        ds4_gpu_stream_nommap_routed_free();     /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned routed prefill tier */
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
             g_stream_expert_cache_up_addr_buffers[layer] = nil;
@@ -8577,6 +8580,391 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return 1;
 }
 
+/* ===================================================================
+ * DS4_METAL_ENABLE_STREAMING_NO_MMAP: page-cache-bypassing fd + owned PERSIST tier (Metal)
+ *
+ * To eliminate the file-backed page cache entirely, no-cache mode preads every
+ * NON-routed tensor the GPU reads into Metal-owned Shared buffers instead of
+ * wrapping the mmap with noCopy views.  ds4_gpu_wrap_model_range() resolves
+ * these owned views first, so the kernels read them transparently (same model
+ * offset, per-tensor striding inside the buffer).  Routed experts continue to
+ * stream via the existing pread expert cache; only the non-routed weights move
+ * here.  Built once at startup, freed at engine close.
+ * =================================================================== */
+static int    g_stream_nommap_fd    = -1;   /* page-cache-bypassing fd (DS4_METAL_ENABLE_STREAMING_NO_MMAP) */
+static size_t g_stream_nommap_align = 0;    /* I/O alignment for g_stream_nommap_fd (1 = none) */
+
+int ds4_gpu_stream_nommap_set_fd(int fd, size_t align) {
+    g_stream_nommap_fd    = fd;
+    g_stream_nommap_align = align;
+    return 1;
+}
+
+#define DS4_OWNED_MAX 4096
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    uint64_t               model_offset;   /* page-aligned file offset */
+    uint64_t               bytes;          /* page-rounded buffer length */
+} ds4_gpu_stream_nommap_view;
+
+static ds4_gpu_stream_nommap_view g_stream_nommap_persist[DS4_OWNED_MAX];
+static uint32_t       g_stream_nommap_persist_count;
+static id             g_stream_nommap_persist_resset;   /* id<MTLResidencySet>, macOS 15+ */
+static uint64_t       g_stream_nommap_persist_bytes;
+
+/* ---- async page-aligned fill (overlap the persist reads) ---------------- */
+static dispatch_queue_t g_stream_nommap_fill_queue;
+static dispatch_group_t g_stream_nommap_fill_group;
+static volatile int32_t g_stream_nommap_fill_err;
+#define DS4_PREAD_CHUNK ((size_t)1 << 30)   /* 1 GiB: macOS pread rejects count > INT_MAX */
+
+static void ds4_gpu_stream_nommap_fill_begin(void) {
+    if (!g_stream_nommap_fill_queue) {
+        g_stream_nommap_fill_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    }
+    if (!g_stream_nommap_fill_group) g_stream_nommap_fill_group = dispatch_group_create();
+    g_stream_nommap_fill_err = 0;
+}
+
+/* Submit a page-aligned pread of [page_off, page_off+want) into dst (want a page
+ * multiple or clamped to EOF).  Runs concurrently with other submitted jobs. */
+static void ds4_gpu_stream_nommap_fill_submit(uint8_t *dst, uint64_t page_off, uint64_t want) {
+    const int fd = g_stream_nommap_fd;
+    dispatch_group_async(g_stream_nommap_fill_group, g_stream_nommap_fill_queue, ^{
+        uint64_t done = 0;
+        while (done < want) {
+            size_t n = (size_t)(want - done);
+            if (n > DS4_PREAD_CHUNK) n = DS4_PREAD_CHUNK;
+            ssize_t r = pread(fd, dst + done, n, (off_t)(page_off + done));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                __atomic_store_n(&g_stream_nommap_fill_err, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            if (r == 0) break;
+            done += (uint64_t)r;
+        }
+        if (done < want) __atomic_store_n(&g_stream_nommap_fill_err, 1, __ATOMIC_RELAXED);
+    });
+}
+
+/* Wait for all submitted reads; returns 1 on success, 0 if any read failed. */
+static int ds4_gpu_stream_nommap_fill_wait(void) {
+    if (g_stream_nommap_fill_group) {
+        dispatch_group_wait(g_stream_nommap_fill_group, DISPATCH_TIME_FOREVER);
+    }
+    return __atomic_load_n(&g_stream_nommap_fill_err, __ATOMIC_RELAXED) == 0;
+}
+
+/* pread the page-aligned span covering [file_offset, file_offset+bytes) into a
+ * fresh Metal-owned Shared buffer.  F_NOCACHE/O_DIRECT only bypass the page
+ * cache for page-aligned I/O, so we widen to page boundaries; the buffer's
+ * .contents is page-aligned by Metal.  Outputs the page-aligned model offset and
+ * rounded length so the view is registered at the aligned offset.  nil on fail. */
+static id<MTLBuffer> ds4_gpu_stream_nommap_pread_buffer(uint64_t model_size,
+                                            uint64_t file_offset, uint64_t bytes,
+                                            uint64_t *out_off, uint64_t *out_len) {
+    if (g_stream_nommap_fd < 0) return nil;
+    if (bytes == 0 || file_offset > model_size || bytes > model_size - file_offset) return nil;
+    const uint64_t page     = (uint64_t)getpagesize();
+    const uint64_t page_off = file_offset & ~(page - 1);
+    const uint64_t leading  = file_offset - page_off;
+    const uint64_t len      = round_up_u64(leading + bytes, page);
+    id<MTLBuffer> buf = [g_device newBufferWithLength:(NSUInteger)len
+                                              options:MTLResourceStorageModeShared];
+    if (!buf) return nil;
+    uint64_t want = len;                          /* clamp the tail read to EOF */
+    if (page_off + want > model_size) want = model_size - page_off;
+    /* The buffer outlives the read: the view array retains it. */
+    ds4_gpu_stream_nommap_fill_submit((uint8_t *)buf.contents, page_off, want);
+    *out_off = page_off;
+    *out_len = len;
+    return buf;
+}
+
+static id ds4_gpu_stream_nommap_residency_build(ds4_gpu_stream_nommap_view *views, uint32_t count,
+                                    NSString *label) {
+#if TARGET_OS_OSX
+    if (count == 0) return nil;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = label;
+        desc.initialCapacity = count;
+        NSError *error = nil;
+        id<MTLResidencySet> set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!set) {
+            fprintf(stderr, "ds4: no-cache owned residency set failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return nil;
+        }
+        for (uint32_t i = 0; i < count; i++) [set addAllocation:views[i].buffer];
+        [set commit];
+        [set requestResidency];
+        return set;
+    }
+#endif
+    (void)views; (void)count; (void)label;
+    return nil;
+}
+
+int ds4_gpu_stream_nommap_persist_built(void) { return g_stream_nommap_persist_count > 0; }
+
+int ds4_gpu_stream_nommap_persist_add(const void *model_map, uint64_t model_size,
+                              uint64_t file_offset, uint64_t bytes) {
+    (void)model_map;
+    if (g_stream_nommap_fd < 0) return 0;
+    if (g_stream_nommap_persist_count >= DS4_OWNED_MAX) return 0;
+    if (g_stream_nommap_persist_count == 0) ds4_gpu_stream_nommap_fill_begin();
+    uint64_t off = 0, len = 0;
+    id<MTLBuffer> buf = ds4_gpu_stream_nommap_pread_buffer(model_size, file_offset, bytes, &off, &len);
+    if (!buf) return 0;
+    g_stream_nommap_persist[g_stream_nommap_persist_count].buffer       = buf;
+    g_stream_nommap_persist[g_stream_nommap_persist_count].model_offset = off;   /* page-aligned */
+    g_stream_nommap_persist[g_stream_nommap_persist_count].bytes        = len;
+    g_stream_nommap_persist_count++;
+    g_stream_nommap_persist_bytes += len;
+    return 1;
+}
+
+void ds4_gpu_stream_nommap_persist_commit(void) {
+    if (g_stream_nommap_persist_count == 0) return;
+    if (!ds4_gpu_stream_nommap_fill_wait()) {
+        fprintf(stderr, "ds4: no-cache persist owned read had an I/O error\n");
+    }
+    g_stream_nommap_persist_resset = ds4_gpu_stream_nommap_residency_build(
+        g_stream_nommap_persist, g_stream_nommap_persist_count, @"ds4_gpu_stream_nommap_persist");
+    fprintf(stderr,
+            "ds4: no-cache: %u no-mmap non-routed views (%.2f GiB) wired (mmap-free)\n",
+            g_stream_nommap_persist_count,
+            (double)g_stream_nommap_persist_bytes / (1024.0 * 1024.0 * 1024.0));
+}
+
+void ds4_gpu_stream_nommap_persist_clear(void) {
+#if TARGET_OS_OSX
+    if (g_stream_nommap_persist_resset) {
+        if (@available(macOS 15.0, *)) {
+            [g_stream_nommap_persist_resset endResidency];
+            [g_stream_nommap_persist_resset removeAllAllocations];
+        }
+        g_stream_nommap_persist_resset = nil;
+    }
+#endif
+    for (uint32_t i = 0; i < g_stream_nommap_persist_count; i++) g_stream_nommap_persist[i].buffer = nil;
+    g_stream_nommap_persist_count = 0;
+    g_stream_nommap_persist_bytes = 0;
+}
+
+/* ---- DS4_METAL_ENABLE_STREAMING_NO_MMAP routed-expert owned tier (prefill wrap path) -------
+ *
+ * The layer-major prefill routed batch wraps the WHOLE gate/up/down expert
+ * tensors of a layer (~2 GiB each) and the kernel strides across experts via
+ * nb02.  With no mmap there is nothing to wrap, so this tier preads those three
+ * tensors into owned Shared buffers that ds4_gpu_wrap_model_range resolves,
+ * keeping the fast batch GEMM unchanged and quant-agnostic.
+ *
+ * The pread is a pure CPU write into the buffer's .contents; it does not touch
+ * the open command batch, so no end/begin split is needed (and crucially no
+ * ds4_gpu_synchronize, whose mid-layer transient-clear + model-cache-evict
+ * corrupted the FFN tail / KV).  Reuse safety comes from DOUBLE BUFFERING: two
+ * sets of three buffers, selected by layer parity, so the set a layer refills is
+ * never the set the previous layer's still-in-flight GEMM is reading.
+ *
+ * CRUCIAL (#388): on macOS 15+ this app makes its large model resources resident
+ * via explicit MTLResidencySets (g_model_residency_set queue-bound; q4 expert
+ * tables [cb useResidencySet:]).  requestResidency alone is enough only for the
+ * persist tier because it settles once at startup; these routed buffers are
+ * (re)built mid-prefill, so they must be declared on the GEMM's command buffer
+ * via [cb useResidencySet:].  Without it the freshly-pread buffer is not
+ * GPU-resident when the routed GEMM runs -> garbage experts -> corrupt KV ->
+ * BOS-repeat.  The set covers the current layer's base slots;
+ * ds4_gpu_stream_nommap_routed_resset is rebuilt per prepare and used by the
+ * routed batch right after it
+ * acquires its command buffer (mirrors the q4 expert-table residency path). */
+/* 6 = two layer-parity sets of (gate, up, down).  The routed prefill batch wraps
+ * the whole gate/up/down expert tensors of a layer; with no mmap they are pread
+ * into these owned Shared buffers.  The two parity sets let layer il+1's read run
+ * in the BACKGROUND (ds4_gpu_stream_nommap_routed_prefetch) while layer il's GEMM
+ * executes, so the F_NOCACHE SSD read overlaps compute instead of stalling in
+ * front of it.  Consecutive layers use opposite parities, and each layer's
+ * end_commands drains its GEMM before the next-but-one layer reuses its parity
+ * set, so a background refill never aliases a live GEMM's buffers. */
+#define DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS 6
+static ds4_gpu_stream_nommap_view g_stream_nommap_routed[DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS];
+static id             g_stream_nommap_routed_resset;   /* id<MTLResidencySet>, macOS 15+; current layer's set */
+
+/* One per layer parity (il & 1).  group/err track that parity's background read;
+ * loaded/in_flight/layer_index say which layer the 3 slots currently hold. */
+typedef struct {
+    dispatch_group_t group;
+    volatile int32_t err;
+    int              in_flight;
+    int              loaded;
+    uint32_t         layer_index;
+} ds4_gpu_stream_nommap_routed_parity;
+static ds4_gpu_stream_nommap_routed_parity g_stream_nommap_routed_pf[2];
+
+static void ds4_gpu_stream_nommap_routed_resset_teardown(void) {
+#if TARGET_OS_OSX
+    if (g_stream_nommap_routed_resset) {
+        if (@available(macOS 15.0, *)) {
+            [g_stream_nommap_routed_resset endResidency];
+            [g_stream_nommap_routed_resset removeAllAllocations];
+        }
+        g_stream_nommap_routed_resset = nil;
+    }
+#endif
+}
+
+static void ds4_gpu_stream_nommap_routed_free(void) {
+    /* Drain any in-flight background read before dropping the buffers. */
+    for (uint32_t p = 0; p < 2; p++) {
+        if (g_stream_nommap_routed_pf[p].in_flight && g_stream_nommap_routed_pf[p].group) {
+            dispatch_group_wait(g_stream_nommap_routed_pf[p].group, DISPATCH_TIME_FOREVER);
+        }
+        g_stream_nommap_routed_pf[p].in_flight   = 0;
+        g_stream_nommap_routed_pf[p].loaded      = 0;
+        g_stream_nommap_routed_pf[p].layer_index = 0;
+        g_stream_nommap_routed_pf[p].err         = 0;
+    }
+    ds4_gpu_stream_nommap_routed_resset_teardown();
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; i++) {
+        g_stream_nommap_routed[i].buffer       = nil;
+        g_stream_nommap_routed[i].model_offset = 0;
+        g_stream_nommap_routed[i].bytes        = 0;
+    }
+}
+
+/* Public end-of-prompt release: drop the routed prefill double-buffer (owned
+ * Shared buffers + residency set) so its whole-layer expert tensors do not stay
+ * wired through gen, which reads experts via the streaming cache rather than
+ * these buffers.  The next prefill re-allocates them lazily in _issue().  Same
+ * teardown as the cleanup path; idempotent (no-op if nothing is allocated). */
+void ds4_gpu_stream_nommap_routed_release(void) {
+    ds4_gpu_stream_nommap_routed_free();
+}
+
+/* Submit a page-aligned pread into a routed slot on this parity's own dispatch
+ * group, so the two parities can be waited on independently. */
+static void ds4_gpu_stream_nommap_routed_fill_submit(ds4_gpu_stream_nommap_routed_parity *p,
+                                                     uint8_t *dst, uint64_t page_off, uint64_t want) {
+    const int fd = g_stream_nommap_fd;
+    dispatch_group_async(p->group, g_stream_nommap_fill_queue, ^{
+        uint64_t done = 0;
+        while (done < want) {
+            size_t n = (size_t)(want - done);
+            if (n > DS4_PREAD_CHUNK) n = DS4_PREAD_CHUNK;
+            ssize_t r = pread(fd, dst + done, n, (off_t)(page_off + done));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
+                return;
+            }
+            if (r == 0) break;
+            done += (uint64_t)r;
+        }
+        if (done < want) __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
+    });
+}
+
+/* Kick off the background pread of layer_index's whole gate/up/down expert
+ * tensors into its parity slots.  Non-blocking: returns after submitting (the
+ * wait happens in ds4_gpu_stream_nommap_routed_ensure).  No-op-safe if the slots
+ * already hold (or are loading) layer_index.  Records model_offset/bytes per slot
+ * so ds4_gpu_wrap_model_range resolves the right buffer.  Returns 1 on success. */
+static int ds4_gpu_stream_nommap_routed_issue(uint64_t model_size,
+                                    const uint64_t *offs, const uint64_t *lens,
+                                    uint32_t layer_index) {
+    if (g_stream_nommap_fd < 0) return 0;
+    const uint32_t parity = layer_index & 1u;
+    const uint32_t base   = parity * 3u;
+    ds4_gpu_stream_nommap_routed_parity *p = &g_stream_nommap_routed_pf[parity];
+    if ((p->in_flight || p->loaded) && p->layer_index == layer_index) {
+        return 1;   /* already loaded or already loading this layer */
+    }
+    /* A pending read for a DIFFERENT layer on this parity must finish before we
+     * overwrite its slots (normally it has already been consumed). */
+    if (p->in_flight) {
+        if (p->group) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+        p->in_flight = 0;
+    }
+    if (!g_stream_nommap_fill_queue) {
+        g_stream_nommap_fill_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    }
+    if (!p->group) p->group = dispatch_group_create();
+    p->err = 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    int submitted = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        const uint32_t s = base + i;
+        if (lens[i] == 0 || offs[i] > model_size || lens[i] > model_size - offs[i]) {
+            if (submitted) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+            p->in_flight = 0; p->loaded = 0;
+            return 0;
+        }
+        const uint64_t page_off = offs[i] & ~(page - 1);
+        const uint64_t leading  = offs[i] - page_off;
+        const uint64_t len      = round_up_u64(leading + lens[i], page);
+        id<MTLBuffer> buf = g_stream_nommap_routed[s].buffer;
+        if (!buf || (uint64_t)buf.length < len) {
+            buf = [g_device newBufferWithLength:(NSUInteger)len
+                                        options:MTLResourceStorageModeShared];
+            if (!buf) {
+                if (submitted) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+                p->in_flight = 0; p->loaded = 0;
+                return 0;
+            }
+            g_stream_nommap_routed[s].buffer = buf;   /* ARC releases any smaller old one */
+        }
+        uint64_t want = len;
+        if (page_off + want > model_size) want = model_size - page_off;
+        ds4_gpu_stream_nommap_routed_fill_submit(p, (uint8_t *)buf.contents, page_off, want);
+        submitted++;
+        g_stream_nommap_routed[s].model_offset = page_off;
+        g_stream_nommap_routed[s].bytes        = len;
+    }
+    p->layer_index = layer_index;
+    p->in_flight   = 1;
+    p->loaded      = 0;
+    return 1;
+}
+
+/* Public: start layer_index's read in the background so it overlaps the current
+ * layer's GEMM.  offs/lens are the three whole-tensor (gate, up, down) model
+ * ranges (page alignment handled internally).  Safe to call repeatedly. */
+int ds4_gpu_stream_nommap_routed_prefetch(uint64_t model_size,
+                                          const uint64_t *offs, const uint64_t *lens,
+                                          uint32_t layer_index) {
+    return ds4_gpu_stream_nommap_routed_issue(model_size, offs, lens, layer_index);
+}
+
+/* Ensure layer_index's slots are filled, then (re)build the residency set the
+ * routed GEMM declares on its command buffer.  If the layer was prefetched its
+ * read is just waited on (usually already complete); otherwise it is issued and
+ * waited on synchronously (e.g. the first layer).  The previous layer's GEMM has
+ * completed at the layer-major loop's per-layer end_commands, so tearing down the
+ * old residency set here is safe.  Returns 1 on success. */
+static int ds4_gpu_stream_nommap_routed_ensure(uint64_t model_size,
+                                    const uint64_t *offs, const uint64_t *lens,
+                                    uint32_t layer_index) {
+    if (g_stream_nommap_fd < 0) return 0;
+    const uint32_t parity = layer_index & 1u;
+    const uint32_t base   = parity * 3u;
+    ds4_gpu_stream_nommap_routed_parity *p = &g_stream_nommap_routed_pf[parity];
+    if (!((p->in_flight || p->loaded) && p->layer_index == layer_index)) {
+        if (!ds4_gpu_stream_nommap_routed_issue(model_size, offs, lens, layer_index)) return 0;
+    }
+    if (p->in_flight) {
+        if (p->group) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+        p->in_flight = 0;
+        if (__atomic_load_n(&p->err, __ATOMIC_RELAXED) != 0) return 0;
+        p->loaded = 1;
+    }
+    ds4_gpu_stream_nommap_routed_resset_teardown();
+    g_stream_nommap_routed_resset = ds4_gpu_stream_nommap_residency_build(
+        &g_stream_nommap_routed[base], 3u, @"ds4_gpu_stream_nommap_routed");
+    return 1;
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
@@ -8590,6 +8978,31 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
     }
 
     const uint64_t end = offset + len;
+
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned PERSIST tier first (per-tensor pread buffers keyed by
+     * page-aligned model offset) so no non-routed tensor read touches the mmap. */
+    for (uint32_t i = 0; i < g_stream_nommap_persist_count; i++) {
+        const uint64_t vs = g_stream_nommap_persist[i].model_offset;
+        const uint64_t ve = vs + g_stream_nommap_persist[i].bytes;
+        if (offset >= vs && end <= ve) {
+            *inner_offset = offset - vs;
+            return g_stream_nommap_persist[i].buffer;
+        }
+    }
+
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP routed-expert owned tier (double-buffered gate/up/down,
+     * refilled per layer by ds4_gpu_stream_nommap_routed_prepare).  Each layer's three
+     * offsets are unique, so only the slot holding the queried tensor matches. */
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; i++) {
+        if (g_stream_nommap_routed[i].bytes == 0) continue;
+        const uint64_t vs = g_stream_nommap_routed[i].model_offset;
+        const uint64_t ve = vs + g_stream_nommap_routed[i].bytes;
+        if (offset >= vs && end <= ve) {
+            *inner_offset = offset - vs;
+            return g_stream_nommap_routed[i].buffer;
+        }
+    }
+
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map ||
             g_model_views[i].model_size != model_size) {
@@ -9018,7 +9431,11 @@ static void ds4_gpu_stream_expert_timing_note_cache_class(
 }
 
 static int ds4_gpu_stream_expert_readahead_enabled(void) {
-    return g_ssd_streaming_mode &&
+    /* Under DS4_METAL_ENABLE_STREAMING_NO_MMAP the whole point is to keep the
+     * page cache clean; F_RDADVISE (below) is a cache read-ahead hint that ignores
+     * F_NOCACHE and would refill file-backed memory, so disable it in no-cache mode. */
+    return g_stream_nommap_fd < 0 &&
+           g_ssd_streaming_mode &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD") == NULL;
 }
 
@@ -9162,6 +9579,85 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
     return threads;
 }
 
+/* Switchable model-byte read for the routed-expert streaming cache.  The cache
+ * machinery (slots / LRU / addr tables) is unchanged; only the byte SOURCE is
+ * abstracted so it honours DS4_METAL_ENABLE_STREAMING_NO_MMAP:
+ *
+ *   - no-os-cache (g_stream_nommap_fd >= 0): macOS F_NOCACHE only truly bypasses the
+ *     page cache for PAGE-ALIGNED I/O, so a raw pread of an unaligned expert
+ *     offset still grows file-backed memory (the whole routed model ends up
+ *     cached).  Read the page-aligned window covering the request via the
+ *     no-cache fd into a bounded page-aligned bounce buffer and copy the
+ *     requested slice into dst (a GPU buffer sized to the exact expert), so
+ *     nothing lands in the OS page cache.
+ *   - otherwise: direct pread on g_model_fd (page cache is acceptable).
+ *
+ * Returns 1 on success, 0 on I/O error / short read. */
+static int ds4_gpu_model_read_into(uint8_t *dst, uint64_t offset, uint64_t len) {
+    if (!dst || len == 0) {
+        return 0;
+    }
+    if (g_stream_nommap_fd < 0) {
+        uint64_t pos = 0;
+        while (pos < len) {
+            const uint64_t rem = len - pos;
+            size_t want = rem > DS4_PREAD_CHUNK ? (size_t)DS4_PREAD_CHUNK : (size_t)rem;
+            ssize_t nread;
+            do {
+                nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            } while (nread < 0 && errno == EINTR);
+            if (nread <= 0) {
+                return 0;
+            }
+            pos += (uint64_t)nread;
+        }
+        return 1;
+    }
+    /* no-os-cache: page-aligned reads via the no-cache fd into a bounded bounce. */
+    const uint64_t align = g_stream_nommap_align ? (uint64_t)g_stream_nommap_align
+                                           : (uint64_t)getpagesize();
+    const uint64_t cap = (uint64_t)32 << 20;   /* 32 MiB bounce ceiling */
+    const uint64_t first_leading = offset & (align - 1);
+    uint64_t bsz = round_up_u64(first_leading + len, align);
+    if (bsz > cap) bsz = cap;
+    void *bounce = NULL;
+    if (posix_memalign(&bounce, (size_t)align, (size_t)bsz) != 0 || !bounce) {
+        return 0;
+    }
+    int ok = 1;
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t file_off = offset + pos;
+        const uint64_t page_off = file_off & ~(align - 1);
+        const uint64_t leading  = file_off - page_off;
+        uint64_t want = len - pos;
+        if (want > bsz - leading) {
+            want = bsz - leading;
+        }
+        const uint64_t read_len = round_up_u64(leading + want, align);   /* <= bsz */
+        /* macOS F_NOCACHE bypasses the page cache ONLY for page-aligned I/O.  Issue
+         * the whole page-aligned window in a single pread: offset (page_off), length
+         * (read_len) and the bounce are all align-multiples, so the kernel sees fully
+         * aligned direct I/O and nothing lands in file-backed memory.  A short return
+         * is terminal (EOF tail expert) and is fine as long as it still covers the
+         * requested slice.  We must NEVER resume at an unaligned (page_off + rd)
+         * offset on a partial read — that silently re-enables caching and grows
+         * file-backed memory token by token during decode. */
+        ssize_t nread;
+        do {
+            nread = pread(g_stream_nommap_fd, bounce, (size_t)read_len, (off_t)page_off);
+        } while (nread < 0 && errno == EINTR);
+        if (nread < 0 || (uint64_t)nread < leading + want) {
+            ok = 0;
+            break;
+        }
+        memcpy(dst + pos, (uint8_t *)bounce + leading, (size_t)want);
+        pos += want;
+    }
+    free(bounce);
+    return ok;
+}
+
 static int ds4_gpu_stream_expert_pread_into(
         uint64_t  offset,
         uint64_t  len,
@@ -9170,7 +9666,7 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    if ((g_model_fd < 0 && g_stream_nommap_fd < 0) ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -9179,30 +9675,15 @@ static int ds4_gpu_stream_expert_pread_into(
     }
 
     const double t0 = ds4_gpu_now_ms();
-    uint64_t pos = 0;
-    int ok = 1;
-    while (pos < len) {
-        const uint64_t rem = len - pos;
-        const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
-        ssize_t nread;
-        do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
-        } while (nread < 0 && errno == EINTR);
-        if (nread <= 0) {
-            ok = 0;
-            break;
-        }
-        pos += (uint64_t)nread;
-    }
+    const int ok = ds4_gpu_model_read_into(dst, offset, len);
     const double dt = ds4_gpu_now_ms() - t0;
-    if (read_bytes) *read_bytes = pos;
+    if (read_bytes) *read_bytes = ok ? len : 0;
     if (ms_out) *ms_out = dt;
-    if (!ok || pos != len) {
+    if (!ok) {
         fprintf(stderr,
-                "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
+                "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB\n",
                 ds4_gpu_gib(offset),
-                ds4_gpu_mib(len),
-                ds4_gpu_mib(pos));
+                ds4_gpu_mib(len));
         return 0;
     }
     return 1;
@@ -33022,6 +33503,28 @@ int ds4_gpu_routed_moe_batch_tensor(
                 }
             }
         } else {
+            /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: there is no mmap to wrap.  Pread this layer's
+             * whole gate/up/down expert tensors into owned Shared buffers, which
+             * ds4_gpu_wrap_model_range then resolves.  This is a pure CPU pread
+             * into the buffer's .contents; it does NOT touch the open command
+             * batch, so no end/begin split (and no ds4_gpu_synchronize, whose
+             * mid-layer transient-clear + cache-evict corrupted the FFN tail and
+             * the KV).  Double-buffered by layer parity so the reused buffer is
+             * never the one the previous layer's still-in-flight GEMM reads. */
+            if (g_stream_nommap_fd >= 0) {
+                const uint64_t r_off[3] = { gate_offset, up_offset, down_offset };
+                const uint64_t r_len[3] = { gate_tensor_bytes, gate_tensor_bytes,
+                                            down_tensor_bytes };
+                /* Waits on the background prefetch started while the previous
+                 * layer's GEMM ran (or reads synchronously for the first layer),
+                 * then activates this layer's residency set. */
+                if (!ds4_gpu_stream_nommap_routed_ensure(model_size, r_off, r_len, layer_index)) {
+                    fprintf(stderr,
+                            "ds4: DS4_METAL_ENABLE_STREAMING_NO_MMAP: routed owned prefill tier failed "
+                            "(layer %u)\n", layer_index);
+                    return 0;
+                }
+            }
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
@@ -33071,6 +33574,16 @@ int ds4_gpu_routed_moe_batch_tensor(
             q4_table_layer_residency &&
             [cb respondsToSelector:@selector(useResidencySet:)]) {
             [cb useResidencySet:q4_table_layer_residency];
+        }
+        /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned routed tier: declare this layer's freshly-pread
+         * owned expert buffers resident on the GEMM command buffer.  Like the q4
+         * expert table above, requestResidency alone does not make a mid-prefill
+         * buffer GPU-resident on macOS 15+; without this the routed GEMM reads
+         * garbage -> corrupt KV -> BOS-repeat (#388 shows the same wrap path is
+         * correct when the experts come from already-resident mmap views). */
+        if (g_stream_nommap_fd >= 0 && g_stream_nommap_routed_resset &&
+            [cb respondsToSelector:@selector(useResidencySet:)]) {
+            [cb useResidencySet:g_stream_nommap_routed_resset];
         }
         const bool moe_stage_profile =
             g_batch_cb != nil &&
