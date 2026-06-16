@@ -2,6 +2,7 @@
 #define DS4_GPU_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -57,6 +58,31 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* Hand the page-cache-bypassing fd (DS4_METAL_ENABLE_STREAMING_NO_MMAP) and its I/O alignment to
+ * the GPU TU so the SSD streaming pread path reads routed-expert bytes through
+ * it (F_NOCACHE/O_DIRECT) instead of the model fd, keeping them out of the OS
+ * page cache.  fd < 0 disables the no-cache path.  No-op on CUDA/ROCm, which
+ * have their own O_DIRECT staging. */
+int ds4_gpu_stream_nommap_set_fd(int fd, size_t align);
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned PERSIST tier: every NON-routed tensor is pread once into
+ * a Metal-owned Shared buffer (no mmap, no page cache) and registered so the
+ * kernels read it transparently via ds4_gpu_wrap_model_range.  Built once at
+ * startup (guarded by _built), freed at engine close.  No-ops on CUDA/ROCm. */
+int  ds4_gpu_stream_nommap_persist_built(void);
+int  ds4_gpu_stream_nommap_persist_add(const void *model_map, uint64_t model_size,
+                               uint64_t file_offset, uint64_t bytes);
+void ds4_gpu_stream_nommap_persist_commit(void);
+void ds4_gpu_stream_nommap_persist_clear(void);
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP routed prefill: start the background pread of
+ * layer_index's whole gate/up/down expert tensors (offs/lens are the three model
+ * ranges) into its parity slots so the F_NOCACHE read overlaps the current
+ * layer's GEMM.  Non-blocking; the routed batch waits on it for that layer. */
+int ds4_gpu_stream_nommap_routed_prefetch(uint64_t model_size,
+                                          const uint64_t *offs, const uint64_t *lens,
+                                          uint32_t layer_index);
+/* End-of-prompt: free the routed prefill double-buffer so it does not stay wired
+ * through gen.  Lazily re-allocated by the next prefill.  No-op if unallocated. */
+void ds4_gpu_stream_nommap_routed_release(void);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);

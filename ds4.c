@@ -1615,8 +1615,9 @@ typedef struct {
 
 typedef struct {
     int fd;
-    const uint8_t *map;
-    uint64_t size;
+    const uint8_t *map;        /* full-file mmap, OR (no_mmap) a malloc'd metadata buffer */
+    uint64_t size;             /* full GGUF file size (tensor-bounds validation) */
+    uint64_t meta_cap;         /* bytes addressable via `map` for cursor reads */
 
     uint32_t version;
     uint64_t n_kv;
@@ -1627,7 +1628,17 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: the file is NOT mmapped (any mmap of the vnode would keep
+     * the OS page cache populated even for F_NOCACHE preads).  `map` then holds
+     * only the metadata region; tensor bytes are pread on demand from `fd` into
+     * `tnc[]` (one cache slot per tensor, NULL until first access). */
+    bool      no_mmap;
+    void    **tnc;
 } ds4_model;
+
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP gate (defined below with the other no-cache plumbing). */
+static bool ds4_no_os_cache_enabled(void);
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -1714,7 +1725,10 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
 static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
     ds4_cursor c = {
         .base = m->map,
-        .size = m->size,
+        /* Cursor reads stay within the addressable metadata region.  With a full
+         * mmap meta_cap == size; with the no-cache metadata buffer it is the
+         * buffer length. */
+        .size = m->meta_cap,
         .pos = pos,
         .error = {0},
     };
@@ -1824,7 +1838,15 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->no_mmap) {
+        if (m->tnc) {
+            for (uint64_t i = 0; i < m->n_tensors; i++) free(m->tnc[i]);
+            free(m->tnc);
+        }
+        free((void *)m->map);            /* malloc'd metadata buffer */
+    } else if (m->map) {
+        munmap((void *)m->map, (size_t)m->size);
+    }
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -1943,7 +1965,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
+                       bool prefetch_cpu, bool nocache_ok) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -1954,25 +1976,69 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
 
-    /*
-     * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
-     * path keeps the file-backed shared mapping. The CPU path only reads the
-     * weights through normal pointers and should not inherit Metal's VM policy:
-     * use a private read-only mapping there.
-     *
-     * This is deliberately defensive against an OS-level Darwin VM bug observed
-     * while the CPU backend streams the very large GGUF through a shared mmap:
-     * the kernel can panic in VM map-count accounting instead of returning a
-     * normal user-space failure. Keeping CPU inference off the shared mapping
-     * avoids that VM accounting path while preserving normal file-backed reads.
-     */
-    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
-    if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
-
     m->fd = fd;
-    m->map = map;
     m->size = (uint64_t)st.st_size;
+
+    if (ds4_no_os_cache_enabled() && nocache_ok) {
+        /*
+         * DS4_METAL_ENABLE_STREAMING_NO_MMAP: do not mmap.  Any mmap of this vnode (even a private
+         * one on another fd) keeps the OS page cache populated for the file, so
+         * F_NOCACHE preads would still grow file-backed memory.  Instead pread
+         * just the metadata region into a heap buffer for cursor/kv parsing;
+         * tensor bytes are pread on demand from `fd` (set F_NOCACHE so those
+         * reads bypass the page cache) into the per-tensor cache.
+         */
+#if defined(__APPLE__) && defined(F_NOCACHE)
+        (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+#if defined(__APPLE__) && defined(F_RDAHEAD)
+        /* F_NOCACHE does not stop the kernel's automatic read-ahead, which still
+         * pulls prefetched pages into file-backed memory.  Disable it on the model
+         * fd so only explicitly pread bytes touch the cache. */
+        (void)fcntl(fd, F_RDAHEAD, 0);
+#endif
+        const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+        uint64_t cap = m->size;
+        const uint64_t META_PREFETCH = (uint64_t)64 << 20;   /* 64 MiB */
+        if (cap > META_PREFETCH) cap = META_PREFETCH;
+        cap = align_up(cap, page);
+        if (cap > m->size) cap = m->size;   /* small files: read to EOF */
+        /* Page-align the destination so the F_NOCACHE read bypasses the cache. */
+        void *metaraw = NULL;
+        if (posix_memalign(&metaraw, (size_t)page, (size_t)align_up(cap, page)) != 0) {
+            ds4_die("out of memory reading model metadata");
+        }
+        uint8_t *metabuf = metaraw;
+        uint64_t done = 0;
+        while (done < cap) {
+            ssize_t r = pread(fd, metabuf + done, (size_t)(cap - done), (off_t)done);
+            if (r < 0) { if (errno == EINTR) continue; ds4_die_errno("cannot read model metadata", path); }
+            if (r == 0) break;
+            done += (uint64_t)r;
+        }
+        m->map = metabuf;
+        m->meta_cap = done;
+        m->no_mmap = true;
+        (void)metal_mapping;
+    } else {
+        /*
+         * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
+         * path keeps the file-backed shared mapping. The CPU path only reads the
+         * weights through normal pointers and should not inherit Metal's VM
+         * policy: use a private read-only mapping there.
+         *
+         * This is deliberately defensive against an OS-level Darwin VM bug
+         * observed while the CPU backend streams the very large GGUF through a
+         * shared mmap: the kernel can panic in VM map-count accounting instead
+         * of returning a normal user-space failure. Keeping CPU inference off
+         * the shared mapping avoids that VM accounting path.
+         */
+        const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+        void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+        if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+        m->map = map;
+        m->meta_cap = m->size;
+    }
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -1987,7 +2053,14 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    if (m->no_mmap) {
+        if (m->tensor_data_pos > m->meta_cap) {
+            ds4_die("model metadata exceeds the 64 MiB no-cache prefetch window");
+        }
+        m->tnc = xcalloc((size_t)m->n_tensors, sizeof(m->tnc[0]));
+    } else if (!metal_mapping && prefetch_cpu) {
+        model_prefetch_cpu_mapping(m);
+    }
 }
 
 static void print_size(uint64_t bytes) {
@@ -2322,8 +2395,124 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 #endif
 #endif
 
-/* Return the in-place tensor payload inside the mapped GGUF. */
+/* ---- DS4_METAL_ENABLE_STREAMING_NO_MMAP: page-cache-bypass plumbing ------------------------
+ *
+ * Opt-in via the DS4_METAL_ENABLE_STREAMING_NO_MMAP env var.  When enabled the engine does not
+ * mmap the model: weights are pread from a page-cache-bypassing fd into
+ * app-owned buffers (per-tensor cache here, Metal-owned buffers in ds4_metal.m)
+ * so the OS unified buffer cache never accumulates across a long-running server
+ * (which on a 128 GiB Mac drives the compressor and eventually hangs).
+ *
+ *   macOS:  open(O_RDONLY) + fcntl(F_NOCACHE,1)  -- no alignment requirement,
+ *           but F_NOCACHE only truly bypasses the cache for page-aligned I/O.
+ *   Linux:  open(O_RDONLY | O_DIRECT)            -- offset/len/buffer must be
+ *           aligned; callers widen reads to page boundaries.
+ *
+ * On any failure the open helper returns -1 and callers fall back to mmap. */
+static int    g_stream_nommap_fd    = -1;     /* engine-wide page-cache-bypassing fd */
+static size_t g_stream_nommap_align = 0;      /* I/O alignment for g_stream_nommap_fd (1 = none) */
+
+/* Read DS4_METAL_ENABLE_STREAMING_NO_MMAP once.  model/engine open run single-threaded at startup,
+ * so the unguarded static cache is safe here. */
+static bool ds4_no_os_cache_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_ENABLE_STREAMING_NO_MMAP");
+        cached = (e && *e &&
+                  (e[0] == '1' || strcmp(e, "on") == 0 || strcmp(e, "true") == 0))
+                 ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* Open a page-cache-bypassing fd on path.  Returns -1 on failure. */
+static int ds4_nocache_open(const char *path) {
+    if (!path) return -1;
+#if defined(__APPLE__)
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+#if defined(F_NOCACHE)
+    if (fcntl(fd, F_NOCACHE, 1) < 0) {
+        /* F_NOCACHE unsupported on this volume: still usable, just cached. */
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: F_NOCACHE failed (%s); DS4_METAL_ENABLE_STREAMING_NO_MMAP reads stay cached\n",
+                strerror(errno));
+    }
+#endif
+#if defined(F_RDAHEAD)
+    /* F_NOCACHE does NOT suppress the kernel's automatic read-ahead: prefetched
+     * pages still land in file-backed memory even though we never reuse them.
+     * Disable read-ahead on the bypass fd so only the bytes we explicitly pread
+     * touch the cache (and those are dropped by F_NOCACHE). */
+    (void)fcntl(fd, F_RDAHEAD, 0);
+#endif
+    return fd;
+#elif defined(O_DIRECT)
+    int fd = open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+        /* Some filesystems (tmpfs, overlayfs) reject O_DIRECT with EINVAL. */
+        ds4_log(stderr, DS4_LOG_WARNING,
+                "ds4: O_DIRECT open failed (%s); DS4_METAL_ENABLE_STREAMING_NO_MMAP disabled\n",
+                strerror(errno));
+        return -1;
+    }
+    return fd;
+#else
+    (void)path;
+    ds4_log(stderr, DS4_LOG_WARNING,
+            "ds4: no page-cache-bypass mechanism on this platform; "
+            "DS4_METAL_ENABLE_STREAMING_NO_MMAP disabled\n");
+    return -1;
+#endif
+}
+
+/* Alignment requirement for I/O on a no-cache fd.  macOS F_NOCACHE only bypasses
+ * the unified buffer cache when offset, length AND the destination buffer are
+ * page-aligned; unaligned reads silently fall back to the cached path (growing
+ * file-backed memory -- exactly what we avoid).  Linux O_DIRECT has the same
+ * requirement (512/4096).  Use the VM page size as a safe superset. */
+static size_t ds4_nocache_alignment(int fd) {
+    (void)fd;
+    const long ps = sysconf(_SC_PAGESIZE);
+    return (ps > 0) ? (size_t)ps : 16384;
+}
+
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP: pread a tensor on demand into its cache slot (the file is not
+ * mmapped).  Cached for the model lifetime; subsequent reads are free.  `fd` is
+ * F_NOCACHE/O_DIRECT so the read bypasses the page cache; the read is widened to
+ * page boundaries (the tensor starts at `leading` inside the slot). */
+static const void *ds4_tensor_data_nocache(const ds4_model *m, const ds4_tensor *t) {
+    const size_t   idx     = (size_t)(t - m->tensors);
+    const uint64_t page    = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t leading = t->abs_offset & (page - 1);   /* offset within first page */
+    /* tnc[idx] holds the page-aligned base; the tensor starts at +leading. */
+    if (m->tnc[idx]) return (const uint8_t *)m->tnc[idx] + leading;
+
+    const uint64_t page_off = t->abs_offset - leading;
+    const uint64_t len      = align_up(leading + (t->bytes ? t->bytes : 1), page);
+    void *raw = NULL;
+    if (posix_memalign(&raw, (size_t)page, (size_t)len) != 0) {
+        ds4_die("out of memory caching a no-cache tensor");
+    }
+    uint64_t want = len;                              /* page-aligned read, clamp to EOF */
+    if (page_off + want > m->size) want = m->size - page_off;
+    uint64_t done = 0;
+    while (done < want) {
+        size_t n = (size_t)(want - done);
+        if (n > ((size_t)1 << 30)) n = (size_t)1 << 30;   /* macOS pread rejects > INT_MAX */
+        ssize_t r = pread(m->fd, (uint8_t *)raw + done, n, (off_t)(page_off + done));
+        if (r < 0) { if (errno == EINTR) continue; ds4_die_errno("no-cache tensor read", ""); }
+        if (r == 0) break;
+        done += (uint64_t)r;
+    }
+    m->tnc[idx] = raw;   /* publishes through the (non-owning) cache array */
+    return (const uint8_t *)raw + leading;
+}
+
+/* Return the tensor payload: a pointer into the mmap, or (no-cache) an on-demand
+ * pread cache slot. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
+    if (m->no_mmap) return ds4_tensor_data_nocache(m, t);
     return m->map + t->abs_offset;
 }
 
@@ -11301,6 +11490,13 @@ static bool metal_graph_install_model_spans(
         const char                   *label) {
     if (!model || !spans || spans->len == 0) return false;
 
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: there is no mmap to wrap.  The non-routed weights are
+     * already resident in the owned PERSIST tier (installed once at engine
+     * open, resolved first by ds4_gpu_wrap_model_range); routed experts stream
+     * via the no-cache fd and never flow through here.  So every runtime span
+     * install is redundant (non-routed) -- treat it as a successful no-op. */
+    if (model->no_mmap) return true;
+
     uint64_t *offsets = xmalloc((size_t)spans->len * sizeof(offsets[0]));
     uint64_t *sizes = xmalloc((size_t)spans->len * sizeof(sizes[0]));
     for (uint32_t i = 0; i < spans->len; i++) {
@@ -11363,6 +11559,8 @@ static void metal_graph_stream_readahead_range_impl(
         !model ||
         model->fd < 0 ||
         !model->map ||
+        model->no_mmap ||   /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: F_RDADVISE would re-pollute the page
+                             * cache; routed experts stream via the no-cache fd */
         offset > model->size ||
         size == 0 ||
         size > model->size - offset) {
@@ -11398,6 +11596,9 @@ static bool metal_graph_stream_madvise_willneed_range_impl(
         uint64_t         size,
         bool             enabled,
         uint64_t        *advised) {
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: no mmap to advise (model->map is the 64 MiB metadata
+     * buffer); a WILLNEED hint would also re-pollute the page cache. */
+    if (model && model->no_mmap) return true;
     if (!enabled ||
         !model ||
         !model->map ||
@@ -12177,6 +12378,17 @@ static bool metal_graph_stream_prepare_range(
         uint64_t                            *touched,
         uint8_t                             *sink) {
     if (!job) return false;
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: no mmap exists to page in (the touch/madvise variants
+     * dereference model->map, which here is only the 64 MiB metadata buffer).
+     * Non-routed weights are resident in the owned PERSIST tier and routed
+     * experts stream via the no-cache fd, so layer page-in is a no-op. */
+    if (job->model && job->model->no_mmap) {
+        (void)sink;
+        if (touched) {
+            *touched = *touched > UINT64_MAX - size ? UINT64_MAX : *touched + size;
+        }
+        return true;
+    }
     if (job->pread_only) {
         return metal_graph_stream_pread_range(job->model,
                                               offset,
@@ -20631,6 +20843,30 @@ static bool metal_graph_prefill_layer_major(
                 metal_graph_stream_readahead_output(model, weights);
             }
         }
+        /* nommap prefill: prefetch the NEXT layer's whole gate/up/down expert
+         * tensors in the background (double-buffered by layer parity) so their
+         * F_NOCACHE SSD read overlaps this layer's routed GEMM instead of
+         * stalling in front of it.  il-1's GEMM has drained at its end_commands,
+         * so refilling il+1's (== il-1's) parity set is safe.  Only the
+         * whole-tensor wrap path (!batch_selected_addr) preads whole tensors;
+         * the selected-addr path streams per expert. */
+        if (g->ssd_streaming && g_stream_nommap_fd >= 0 && !batch_selected_addr &&
+            n_tokens > 1 && il + 1 < DS4_N_LAYER) {
+            const ds4_layer_weights *nl = &weights->layer[il + 1];
+            if (nl->ffn_gate_exps && nl->ffn_up_exps && nl->ffn_down_exps) {
+                const uint64_t ng_row = routed_expert_row_bytes(nl->ffn_gate_exps);
+                const uint64_t nd_row = routed_expert_row_bytes(nl->ffn_down_exps);
+                const uint64_t ng_eb  = (uint64_t)nl->ffn_gate_exps->dim[1] * ng_row;
+                const uint64_t nd_eb  = (uint64_t)nl->ffn_down_exps->dim[1] * nd_row;
+                const uint64_t pf_off[3] = { nl->ffn_gate_exps->abs_offset,
+                                             nl->ffn_up_exps->abs_offset,
+                                             nl->ffn_down_exps->abs_offset };
+                const uint64_t pf_len[3] = { (uint64_t)DS4_N_EXPERT * ng_eb,
+                                             (uint64_t)DS4_N_EXPERT * ng_eb,
+                                             (uint64_t)DS4_N_EXPERT * nd_eb };
+                (void)ds4_gpu_stream_nommap_routed_prefetch(model->size, pf_off, pf_len, il + 1);
+            }
+        }
         if (split_profile) {
             const double t_attn0 = now_sec();
             ok = ds4_gpu_begin_commands() != 0;
@@ -21056,6 +21292,14 @@ static bool metal_graph_prefill_chunked_range(
         pos0 = chunk_end;
     }
     if (show_progress) fputc('\n', stderr);
+    /* nommap: free the routed prefill double-buffer (owned whole-layer expert
+     * tensors + residency set) before gen so that RAM is not left wired idle
+     * through decode -- gen reads experts via the streaming cache, not these
+     * buffers.  The next prefill re-allocates them lazily.  Footprint-only
+     * (nommap has no prefill/gen budget split to grow). */
+    if (g->ssd_streaming && g_stream_nommap_fd >= 0) {
+        ds4_gpu_stream_nommap_routed_release();
+    }
     if (profile) {
         const double t_read = now_sec();
         fprintf(stderr,
@@ -24932,7 +25176,7 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+    model_open(&model, model_path, false, false, /*nocache_ok=*/false);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
@@ -25603,12 +25847,33 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (opt->warm_weights) model_warm_weights(&e->model);
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP is a Metal-only path on this branch: CUDA/ROCm already
+     * bypass the page cache via their own O_DIRECT staging, and their
+     * accelerator_cache_model_tensors() still reads the model through m->map.
+     * Gate the mmap-free load to the Metal backend so those paths keep mmap. */
+    const bool nocache_ok = (opt->backend == DS4_BACKEND_METAL);
+    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only,
+               nocache_ok);
+    /* model_warm_weights touches the full tensor range through m->map; with the
+     * no-cache metadata-only buffer that would read past meta_cap. */
+    if (opt->warm_weights && !e->model.no_mmap) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->model.no_mmap && !e->ssd_streaming) {
+        /* No mmap means routed experts have no GPU supply path unless the SSD
+         * streaming pread cache provides them: the non-streaming Metal decode
+         * maps the routed experts as mmap noCopy views, which no longer exist.
+         * Require --ssd-streaming so routed experts stream from the no-cache fd. */
+        fprintf(stderr,
+                "ds4: DS4_METAL_ENABLE_STREAMING_NO_MMAP on Metal requires --ssd-streaming "
+                "(routed experts are served from the streaming pread cache; "
+                "without mmap there is no other GPU supply path)\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -25687,7 +25952,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true,
+                   /*nocache_ok=*/false);   /* separate file; mmap is fine */
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -25763,11 +26029,64 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: open a dedicated page-cache-bypassing fd and hand it
+         * to the Metal TU.  The owned PERSIST tier preads non-routed tensors
+         * through it (F_NOCACHE/O_DIRECT); failure here is fatal because without
+         * the mmap there is no fallback supply path for those weights. */
+        if (e->model.no_mmap && g_stream_nommap_fd < 0) {
+            g_stream_nommap_fd = ds4_nocache_open(opt->model_path);
+            if (g_stream_nommap_fd < 0) {
+                fprintf(stderr, "ds4: DS4_METAL_ENABLE_STREAMING_NO_MMAP: no-cache fd open failed; aborting startup\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            g_stream_nommap_align = ds4_nocache_alignment(g_stream_nommap_fd);
+            fprintf(stderr,
+                    "ds4: DS4_METAL_ENABLE_STREAMING_NO_MMAP enabled (no-cache fd=%d, align=%zu)\n",
+                    g_stream_nommap_fd, g_stream_nommap_align);
+            (void)ds4_gpu_stream_nommap_set_fd(g_stream_nommap_fd, g_stream_nommap_align);
+        }
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
-        if (e->ssd_streaming) {
+        if (e->model.no_mmap) {
+            /* DS4_METAL_ENABLE_STREAMING_NO_MMAP: there is no mmap, so the GPU cannot wrap noCopy
+             * model views.  Pread every NON-routed tensor once into a Metal-owned
+             * buffer (persist tier); the routed experts continue to stream via
+             * the no-cache model fd.  ds4_gpu_wrap_model_range() resolves the
+             * persist tier first, so the kernels read these weights
+             * transparently.  Routed experts are deliberately excluded (they are
+             * served by the SSD streaming pread cache, required in this mode). */
+            bool nok = true;
+            if (!ds4_gpu_stream_nommap_persist_built()) {
+                for (uint64_t ti = 0; ti < e->model.n_tensors && nok; ti++) {
+                    const ds4_tensor *T = &e->model.tensors[ti];
+                    if (T->bytes == 0) continue;
+                    bool is_routed = false;
+                    for (uint32_t il = 0; il < DS4_N_LAYER && !is_routed; il++) {
+                        const ds4_layer_weights *L = &e->weights.layer[il];
+                        if (T == L->ffn_gate_exps || T == L->ffn_up_exps ||
+                            T == L->ffn_down_exps) {
+                            is_routed = true;
+                        }
+                    }
+                    if (is_routed) continue;   /* routed: streamed, not owned here */
+                    if (!ds4_gpu_stream_nommap_persist_add(e->model.map, e->model.size,
+                                                   T->abs_offset, T->bytes)) {
+                        fprintf(stderr,
+                                "ds4: DS4_METAL_ENABLE_STREAMING_NO_MMAP: owned persist view failed "
+                                "(tensor %llu, %.2f MiB)\n",
+                                (unsigned long long)ti,
+                                (double)T->bytes / (1024.0 * 1024.0));
+                        nok = false;
+                    }
+                }
+                if (nok) ds4_gpu_stream_nommap_persist_commit();
+            }
+            model_map_ok = nok ? 1 : 0;
+        } else if (e->ssd_streaming) {
             const bool map_output = load_slice &&
                                     (load_output ||
                                      (load_output_optional &&
@@ -26027,8 +26346,13 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
-    ds4_gpu_cleanup();
+    ds4_gpu_cleanup();   /* also frees the owned PERSIST tier (DS4_METAL_ENABLE_STREAMING_NO_MMAP) */
 #endif
+    if (g_stream_nommap_fd >= 0) {
+        close(g_stream_nommap_fd);
+        g_stream_nommap_fd = -1;
+        g_stream_nommap_align = 0;
+    }
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);

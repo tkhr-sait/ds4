@@ -2705,6 +2705,23 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
     return ds4_gpu_set_model_fd_for_map(fd, g_model_host_base);
 }
 
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP is a Metal-only concern: the CUDA/ROCm backend already streams
+ * weights through its own O_DIRECT staging path (g_model_direct_fd), so the
+ * no-cache fd and owned PERSIST tier are no-ops here. */
+extern "C" int ds4_gpu_stream_nommap_set_fd(int fd, size_t align) {
+    (void)fd;
+    (void)align;
+    return 1;
+}
+extern "C" int ds4_gpu_stream_nommap_persist_built(void) { return 0; }
+extern "C" int ds4_gpu_stream_nommap_persist_add(const void *model_map, uint64_t model_size,
+                                         uint64_t file_offset, uint64_t bytes) {
+    (void)model_map; (void)model_size; (void)file_offset; (void)bytes;
+    return 0;
+}
+extern "C" void ds4_gpu_stream_nommap_persist_commit(void) {}
+extern "C" void ds4_gpu_stream_nommap_persist_clear(void) {}
+
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
