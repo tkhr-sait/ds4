@@ -1,0 +1,149 @@
+1781632896 PHYSMEM PhysMem: 4073M used (2205M wired, 1038M compressor), 123G unused.
+1781632901 PHYSMEM PhysMem: 6734M used (2198M wired, 1029M compressor), 121G unused.
+1781632906 PHYSMEM PhysMem: 41G used (9910M wired, 1028M compressor), 86G unused.
+1781632911 PHYSMEM PhysMem: 72G used (9910M wired, 1028M compressor), 56G unused.
+1781632917 PHYSMEM PhysMem: 102G used (9938M wired, 1027M compressor), 25G unused.
+1781632922 PHYSMEM PhysMem: 127G used (10G wired, 1026M compressor), 120M unused.
+1781632927 PHYSMEM PhysMem: 127G used (9906M wired, 1025M compressor), 101M unused.
+1781632932 PHYSMEM PhysMem: 127G used (42G wired, 1023M compressor), 63M unused.
+1781632937 PHYSMEM PhysMem: 127G used (73G wired, 1022M compressor), 68M unused.
+1781632942 PHYSMEM PhysMem: 127G used (88G wired, 1022M compressor), 55M unused.
+1781632947 PHYSMEM PhysMem: 127G used (93G wired, 1021M compressor), 63M unused.
+1781632952 PHYSMEM PhysMem: 127G used (17G wired, 1206M compressor), 98M unused.
+1781632952 23113  ds4-server       62M  
+1781632957 PHYSMEM PhysMem: 127G used (17G wired, 1178M compressor), 64M unused.
+1781632957 23113  ds4-server       61M  
+1781632963 PHYSMEM PhysMem: 127G used (17G wired, 1165M compressor), 57M unused.
+1781632963 23113  ds4-server       61M  
+1781632968 PHYSMEM PhysMem: 127G used (17G wired, 1164M compressor), 79M unused.
+1781632968 23113  ds4-server       61M  
+1781632973 PHYSMEM PhysMem: 127G used (17G wired, 1163M compressor), 82M unused.
+1781632973 23113  ds4-server       61M  
+1781632978 PHYSMEM PhysMem: 127G used (17G wired, 1162M compressor), 77M unused.
+1781632978 23113  ds4-server       61M  
+1781632983 PHYSMEM PhysMem: 127G used (17G wired, 1150M compressor), 105M unused.
+1781632983 23113  ds4-server       61M  
+1781632988 PHYSMEM PhysMem: 127G used (17G wired, 1134M compressor), 143M unused.
+1781632988 23113  ds4-server       61M  
+1781632994 PHYSMEM PhysMem: 127G used (15G wired, 1129M compressor), 89M unused.
+1781632994 23113  ds4-server       59M  
+1781632999 PHYSMEM PhysMem: 127G used (17G wired, 1128M compressor), 62M unused.
+1781632999 23113  ds4-server       59M  
+1781633004 PHYSMEM PhysMem: 127G used (17G wired, 1128M compressor), 105M unused.
+1781633004 23113  ds4-server       59M  
+1781633009 PHYSMEM PhysMem: 127G used (17G wired, 1128M compressor), 92M unused.
+1781633009 23113  ds4-server       59M  
+1781633014 PHYSMEM PhysMem: 127G used (17G wired, 1128M compressor), 66M unused.
+1781633014 23113  ds4-server       59M  
+1781633019 PHYSMEM PhysMem: 127G used (17G wired, 1127M compressor), 87M unused.
+1781633019 23113  ds4-server       59M  
+1781633025 PHYSMEM PhysMem: 127G used (16G wired, 1127M compressor), 70M unused.
+1781633025 23113  ds4-server       59M  
+1781633030 PHYSMEM PhysMem: 127G used (36G wired, 1115M compressor), 233M unused.
+1781633030 23113  ds4-server       32M  
+1781633035 PHYSMEM PhysMem: 127G used (66G wired, 1099M compressor), 67M unused.
+1781633035 23113  ds4-server       29M  
+1781633040 PHYSMEM PhysMem: 127G used (90G wired, 1097M compressor), 71M unused.
+1781633040 23113  ds4-server       25M  
+1781633045 PHYSMEM PhysMem: 127G used (101G wired, 1097M compressor), 66M unused.
+1781633045 23113  ds4-server       24M  
+1781633050 PHYSMEM PhysMem: 127G used (101G wired, 5035M compressor), 79M unused.
+1781633050 23113  ds4-server       55M  
+1781633055 PHYSMEM PhysMem: 127G used (101G wired, 5053M compressor), 69M unused.
+1781633055 23113  ds4-server       68M  
+1781633060 PHYSMEM PhysMem: 127G used (101G wired, 5025M compressor), 65M unused.
+1781633060 23113  ds4-server       67M  
+1781633065 PHYSMEM PhysMem: 127G used (101G wired, 5028M compressor), 58M unused.
+1781633065 23113  ds4-server       67M  
+1781633071 PHYSMEM PhysMem: 127G used (101G wired, 5033M compressor), 67M unused.
+1781633071 23113  ds4-server       67M  
+1781633076 PHYSMEM PhysMem: 127G used (101G wired, 5033M compressor), 59M unused.
+1781633076 23113  ds4-server       68M  
+1781633081 PHYSMEM PhysMem: 127G used (101G wired, 5035M compressor), 70M unused.
+1781633081 23113  ds4-server       68M  
+1781633086 PHYSMEM PhysMem: 127G used (101G wired, 5029M compressor), 63M unused.
+1781633086 23113  ds4-server       68M  
+1781633091 PHYSMEM PhysMem: 127G used (101G wired, 5030M compressor), 66M unused.
+1781633091 23113  ds4-server       68M  
+1781633096 PHYSMEM PhysMem: 127G used (101G wired, 5054M compressor), 61M unused.
+1781633096 23113  ds4-server       68M  
+1781633101 PHYSMEM PhysMem: 127G used (101G wired, 5021M compressor), 84M unused.
+1781633101 23113  ds4-server       68M  
+1781633106 PHYSMEM PhysMem: 127G used (101G wired, 5022M compressor), 68M unused.
+1781633106 23113  ds4-server       68M  
+1781633111 PHYSMEM PhysMem: 127G used (101G wired, 5037M compressor), 67M unused.
+1781633111 23113  ds4-server       68M  
+1781633117 PHYSMEM PhysMem: 127G used (101G wired, 5034M compressor), 68M unused.
+1781633117 23113  ds4-server       68M  
+1781633122 PHYSMEM PhysMem: 127G used (101G wired, 5034M compressor), 64M unused.
+1781633122 23113  ds4-server       68M  
+1781633127 PHYSMEM PhysMem: 127G used (101G wired, 5055M compressor), 63M unused.
+1781633127 23113  ds4-server       68M  
+1781633132 PHYSMEM PhysMem: 127G used (101G wired, 5032M compressor), 78M unused.
+1781633132 23113  ds4-server       68M  
+1781633137 PHYSMEM PhysMem: 127G used (101G wired, 5037M compressor), 67M unused.
+1781633137 23113  ds4-server       68M  
+1781633142 PHYSMEM PhysMem: 127G used (101G wired, 5040M compressor), 72M unused.
+1781633142 23113  ds4-server       68M  
+1781633147 PHYSMEM PhysMem: 127G used (101G wired, 5035M compressor), 73M unused.
+1781633147 23113  ds4-server       68M  
+1781633152 PHYSMEM PhysMem: 127G used (101G wired, 5047M compressor), 65M unused.
+1781633152 23113  ds4-server       68M  
+1781633157 PHYSMEM PhysMem: 127G used (101G wired, 5041M compressor), 66M unused.
+1781633157 23113  ds4-server       68M  
+1781633163 PHYSMEM PhysMem: 127G used (101G wired, 5015M compressor), 132M unused.
+1781633163 23113  ds4-server       68M  
+1781633168 PHYSMEM PhysMem: 127G used (101G wired, 5025M compressor), 72M unused.
+1781633168 23113  ds4-server       68M  
+1781633173 PHYSMEM PhysMem: 127G used (101G wired, 5034M compressor), 68M unused.
+1781633173 23113  ds4-server       68M  
+1781633178 PHYSMEM PhysMem: 127G used (101G wired, 5041M compressor), 69M unused.
+1781633178 23113  ds4-server       68M  
+1781633183 PHYSMEM PhysMem: 127G used (101G wired, 5042M compressor), 70M unused.
+1781633183 23113  ds4-server       68M  
+1781633188 PHYSMEM PhysMem: 127G used (101G wired, 5045M compressor), 67M unused.
+1781633188 23113  ds4-server       68M  
+1781633193 PHYSMEM PhysMem: 127G used (101G wired, 5070M compressor), 66M unused.
+1781633193 23113  ds4-server       68M  
+1781633198 PHYSMEM PhysMem: 127G used (101G wired, 5049M compressor), 60M unused.
+1781633198 23113  ds4-server       68M  
+1781633203 PHYSMEM PhysMem: 127G used (101G wired, 5050M compressor), 68M unused.
+1781633203 23113  ds4-server       68M  
+1781633209 PHYSMEM PhysMem: 127G used (101G wired, 5068M compressor), 83M unused.
+1781633209 23113  ds4-server       68M  
+1781633214 PHYSMEM PhysMem: 127G used (101G wired, 5044M compressor), 75M unused.
+1781633214 23113  ds4-server       68M  
+1781633219 PHYSMEM PhysMem: 127G used (101G wired, 5055M compressor), 77M unused.
+1781633219 23113  ds4-server       68M  
+1781633224 PHYSMEM PhysMem: 127G used (101G wired, 5009M compressor), 143M unused.
+1781633224 23113  ds4-server       68M  
+1781633229 PHYSMEM PhysMem: 127G used (101G wired, 5037M compressor), 217M unused.
+1781633229 23113  ds4-server       69M  
+1781633234 PHYSMEM PhysMem: 127G used (101G wired, 5035M compressor), 79M unused.
+1781633234 23113  ds4-server       68M  
+1781633239 PHYSMEM PhysMem: 127G used (101G wired, 5047M compressor), 68M unused.
+1781633239 23113  ds4-server       68M  
+1781633244 PHYSMEM PhysMem: 127G used (101G wired, 5046M compressor), 67M unused.
+1781633244 23113  ds4-server       68M  
+1781633249 PHYSMEM PhysMem: 127G used (101G wired, 5050M compressor), 87M unused.
+1781633249 23113  ds4-server       68M  
+1781633255 PHYSMEM PhysMem: 127G used (101G wired, 5055M compressor), 72M unused.
+1781633255 23113  ds4-server       68M  
+1781633260 PHYSMEM PhysMem: 127G used (101G wired, 5034M compressor), 139M unused.
+1781633260 23113  ds4-server       56M  
+1781633265 PHYSMEM PhysMem: 127G used (101G wired, 5062M compressor), 69M unused.
+1781633265 23113  ds4-server       69M  
+1781633270 PHYSMEM PhysMem: 127G used (101G wired, 5055M compressor), 67M unused.
+1781633270 23113  ds4-server       69M  
+1781633275 PHYSMEM PhysMem: 127G used (16G wired, 4996M compressor), 321M unused.
+1781633275 23113  ds4-server       68M  
+1781633280 PHYSMEM PhysMem: 127G used (16G wired, 4981M compressor), 152M unused.
+1781633280 23113  ds4-server       68M  
+1781633285 PHYSMEM PhysMem: 127G used (16G wired, 4976M compressor), 344M unused.
+1781633285 23113  ds4-server       68M  
+1781633290 PHYSMEM PhysMem: 127G used (16G wired, 4972M compressor), 417M unused.
+1781633290 23113  ds4-server       68M  
+1781633295 PHYSMEM PhysMem: 127G used (16G wired, 4972M compressor), 452M unused.
+1781633295 23113  ds4-server       68M  
+1781633301 PHYSMEM PhysMem: 127G used (16G wired, 4972M compressor), 455M unused.
+1781633301 23113  ds4-server       68M  

@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="588" viewBox="0 0 960 588">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 22px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 13px; font-weight: 600; fill: #334155; }
+.tick { font-size: 11px; fill: #64748b; }
+.legend { font-size: 12px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="588" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">q4-baseline-opencode-b81920: prefill + gen throughput</text>
+<rect x="86.00" y="122" width="42.03" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="128.69" y="122" width="29.54" height="320" fill="#dbeafe" fill-opacity="0.55"/>
+<rect x="158.23" y="122" width="123.45" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="282.12" y="122" width="211.01" height="320" fill="#f3e8ff" fill-opacity="0.55"/>
+<rect x="493.13" y="122" width="2.63" height="320" fill="#fef3c7" fill-opacity="0.55"/>
+<rect x="496.11" y="122" width="10.16" height="320" fill="#f3e8ff" fill-opacity="0.55"/>
+<line x1="86" y1="442.00" x2="874" y2="442.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="446.00" text-anchor="end">0</text>
+<line x1="86" y1="362.00" x2="874" y2="362.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="366.00" text-anchor="end">50</text>
+<line x1="86" y1="282.00" x2="874" y2="282.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="286.00" text-anchor="end">100</text>
+<line x1="86" y1="202.00" x2="874" y2="202.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="206.00" text-anchor="end">150</text>
+<line x1="86" y1="122.00" x2="874" y2="122.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="76" y="126.00" text-anchor="end">200</text>
+<text class="tick" x="884" y="446.00" text-anchor="start">0</text>
+<text class="tick" x="884" y="366.00" text-anchor="start">5</text>
+<text class="tick" x="884" y="286.00" text-anchor="start">10</text>
+<text class="tick" x="884" y="206.00" text-anchor="start">15</text>
+<text class="tick" x="884" y="126.00" text-anchor="start">20</text>
+<line x1="86.00" y1="122" x2="86.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="86.00" y="462" text-anchor="middle">0s</text>
+<line x1="164.80" y1="122" x2="164.80" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="164.80" y="462" text-anchor="middle">1m</text>
+<line x1="243.60" y1="122" x2="243.60" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="243.60" y="462" text-anchor="middle">2m</text>
+<line x1="322.40" y1="122" x2="322.40" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="322.40" y="462" text-anchor="middle">3m</text>
+<line x1="401.20" y1="122" x2="401.20" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="401.20" y="462" text-anchor="middle">4m</text>
+<line x1="480.00" y1="122" x2="480.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="480.00" y="462" text-anchor="middle">5m</text>
+<line x1="558.80" y1="122" x2="558.80" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="558.80" y="462" text-anchor="middle">6m</text>
+<line x1="637.60" y1="122" x2="637.60" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="637.60" y="462" text-anchor="middle">7m</text>
+<line x1="716.40" y1="122" x2="716.40" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="716.40" y="462" text-anchor="middle">8m</text>
+<line x1="795.20" y1="122" x2="795.20" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="795.20" y="462" text-anchor="middle">9m</text>
+<line x1="874.00" y1="122" x2="874.00" y2="442" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="874.00" y="462" text-anchor="middle">10m</text>
+<line x1="86" y1="122" x2="86" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="86" y1="442" x2="874" y2="442" stroke="#334155" stroke-width="1.2"/>
+<line x1="874" y1="122" x2="874" y2="442" stroke="#334155" stroke-width="1.2"/>
+<text class="axis-label" x="480.0" y="570" text-anchor="middle">seconds since first request</text>
+<text class="legend" x="86.00" y="472.00">#1 55s [title gen] prefill=542@16.8t/s gen=241@10.6t/s cache=0% stop | Generate a title for this conversation:</text>
+<text class="legend" x="86.00" y="488.00">#2 4m15s [agent→write] prefill=10656@113.2t/s gen=1767@11.0t/s cache=0% tool_calls | create minesweeper. 1 html file. file n…</text>
+<text class="legend" x="86.00" y="504.00">#3 9.5s [tool-result] prefill=12439 gen=55@7.6t/s cache=100% stop | Wrote file successfully.</text>
+<text class="legend" x="86.00" y="520.00">Σ total 5m19s (3 sessions)</text>
+<text class="axis-label" x="22" y="282.0" text-anchor="middle" transform="rotate(-90 22 282.0)">prefill tokens / second</text>
+<text class="axis-label" x="938" y="282.0" text-anchor="middle" transform="rotate(90 938 282.0)">gen tokens / second</text>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="121.46,435.78 128.03,435.78"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="158.23,197.26 193.69,197.26 230.47,207.63 273.81,324.24 281.69,436.32"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="493.13,430.45 495.76,430.45"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="121.46,410.69 128.03,415.09"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="158.23,197.26 193.69,197.26 230.47,202.56 273.81,248.48 281.69,260.85"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="493.13,430.45 495.76,430.45"/>
+<polyline fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="128.69,335.28 138.53,335.28 145.10,267.28 150.35,253.04 154.29,205.84 158.23,225.36"/>
+<polyline fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="282.12,300.88 289.57,300.88 297.45,304.56 304.01,292.40 310.58,283.12 317.15,269.04 322.40,251.44 327.65,242.80 332.91,238.32 338.16,239.28 343.41,224.56 348.67,245.04 353.92,244.56 360.49,290.16 365.74,261.20 372.31,266.16 377.56,263.44 384.13,252.72 389.38,266.48 394.63,246.00 401.20,253.84 406.45,272.24 411.71,237.52 416.96,252.08 423.53,250.32 428.78,268.40 434.03,251.60 440.60,274.16 447.17,260.40 452.42,257.68 457.67,261.84 464.24,254.32 470.81,292.24 477.37,291.44 483.94,271.44 490.51,285.68 493.13,301.20"/>
+<polyline fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="496.11,323.28 504.95,323.28 506.27,287.44"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="128.69,335.28 138.53,335.28 145.10,309.52 150.35,294.80 154.29,279.60 158.23,272.24"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="282.12,300.88 289.57,300.88 297.45,302.80 304.01,299.44 310.58,295.60 317.15,290.96 322.40,285.68 327.65,280.72 332.91,276.40 338.16,272.88 343.41,269.04 348.67,267.12 353.92,265.52 360.49,267.60 365.74,267.12 372.31,267.12 377.56,266.96 384.13,266.16 389.38,266.16 394.63,265.20 401.20,264.72 406.45,265.04 411.71,263.92 416.96,263.44 423.53,262.96 428.78,263.12 434.03,262.80 440.60,263.28 447.17,263.12 452.42,262.96 457.67,262.96 464.24,262.64 470.81,263.76 477.37,264.72 483.94,264.88 490.51,265.52 493.13,266.00"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6 3" points="496.11,323.28 504.95,323.28 506.27,320.72"/>
+<line x1="86.00" y1="122" x2="86.00" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="86.00" y1="101.00" x2="86.00" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="90.00" y="98.00" text-anchor="start">#1 55s [title gen]</text>
+<line x1="158.23" y1="122" x2="158.23" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="158.23" y1="117.00" x2="158.23" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="162.23" y="114.00" text-anchor="start">#2 4m15s [agent→write]</text>
+<line x1="493.13" y1="122" x2="493.13" y2="442" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+<line x1="493.13" y1="101.00" x2="493.13" y2="122.00" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 2"/>
+<text class="tick" x="497.13" y="98.00" text-anchor="start">#3 9.5s [tool-result]</text>
+<rect x="636" y="124" width="170" height="82" rx="6" fill="#ffffff" fill-opacity="0.92" stroke="#cbd5e1"/>
+<rect x="644" y="132" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="668" y="142">prefill chunk t/s</text>
+<rect x="644" y="150" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="668" y="160">prefill avg t/s</text>
+<line x1="644" y1="174" x2="662" y2="174" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6 3"/>
+<text class="legend" x="668" y="178">gen chunk t/s</text>
+<line x1="644" y1="192" x2="662" y2="192" stroke="#16a34a" stroke-width="2" stroke-dasharray="6 3"/>
+<text class="legend" x="668" y="196">gen avg t/s</text>
+<rect x="266.0" y="573" width="14" height="11" fill="#fef3c7" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="284.0" y="583" text-anchor="start">prefill (Metal residency build)</text>
+<rect x="497.5" y="573" width="14" height="11" fill="#dbeafe" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="515.5" y="583" text-anchor="start">THINKING gen</text>
+<rect x="605.5" y="573" width="14" height="11" fill="#f3e8ff" fill-opacity="0.85" stroke="#cbd5e1"/>
+<text class="tick" x="623.5" y="583" text-anchor="start">TOOLS gen</text>
+</svg>

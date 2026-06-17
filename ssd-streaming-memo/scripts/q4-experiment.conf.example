@@ -1,0 +1,14 @@
+# q4-experiment machine config — copy to q4-experiment.conf (gitignored) and edit.
+# Sourced by q4-experiment.sh. Keeps machine-specific absolute paths OUT of the
+# scripts and OUT of every per-run command line.
+
+# ds4 repo root that holds gguf/ and the model files.
+# (Default if unset: <scripts>/../ds4 — i.e. a sibling checkout.)
+export DS4="$HOME/projects/dev/ds4"
+
+# ds4-server binary. May live in a DIFFERENT repo than the models above, so it
+# is configured separately. Read by run.sh.
+export DS4_SERVER_BIN="$HOME/ghq/github.com/antirez/ds4/ds4-server"
+
+# Optional: opencode binary if not on PATH.
+# export OPENCODE="opencode"
