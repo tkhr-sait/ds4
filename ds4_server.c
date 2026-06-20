@@ -4457,8 +4457,9 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
      * duplicates it into both reasoning and structured tool_calls, and can make
      * clients execute something the assistant had not actually emitted as its
      * post-thinking action. */
+    const char *think_end = NULL;
     if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
+        think_end = find_last_substr(text, "</think>");
         if (!think_end) {
             /* Model did not close thinking, ignore any DSML in reasoning */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
@@ -4487,12 +4488,63 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         start = strstr(tool_search, "<tool_calls>");
         style = start ? 1 : style;
     }
-    if (!start) {
+
+    /* Recovery straddle: the model opened a tool_calls stanza inside thinking and
+     * the forced </think> (chat_think_tool_recovery) split it -- the opening sits
+     * just before </think> and the invoke body follows after it.  The after-</think>
+     * search above then finds no opening even though a real, complete tool call was
+     * emitted (this is exactly what the recovery is for).  Detect the dangling
+     * opening at the tail of the thinking region and parse the body after </think>.
+     * raw_dsml is left NULL so round-trip rendering re-synthesizes a clean stanza
+     * from the parsed calls (append_dsml_tool_calls_text fallback). */
+    bool straddle = false;
+    if (!start && require_thinking_closed && think_end) {
+        static const struct {
+            const char *open;
+            const char *invoke;
+            const char *close;
+            int style;
+        } straddle_opens[] = {
+            { DS4_TOOL_CALLS_START,       DS4_INVOKE_START,       DS4_TOOL_CALLS_END,       0 },
+            { DS4_TOOL_CALLS_START_SHORT, DS4_INVOKE_START_SHORT, DS4_TOOL_CALLS_END_SHORT, 2 },
+            { "<tool_calls>",             "<invoke",              "</tool_calls>",          1 },
+        };
+        const char *body = skip_ascii_ws(think_end + 8);
+        for (size_t oi = 0;
+             oi < sizeof(straddle_opens) / sizeof(straddle_opens[0]);
+             oi++) {
+            const char *marker = straddle_opens[oi].open;
+            const size_t mlen = strlen(marker);
+            const char *last = NULL;
+            for (const char *q = text;
+                 (q = strstr(q, marker)) != NULL && q < think_end;
+                 q++) {
+                if (q + mlen <= think_end) last = q;
+            }
+            if (!last) continue;
+            /* The opening must abut </think> (only whitespace between) so we do not
+             * resurrect DSML merely quoted earlier in reasoning, AND the body after
+             * </think> must actually begin the stanza (an invoke, or an immediate
+             * close for an empty one) -- otherwise this was a stray opening followed
+             * by ordinary content, which stays content. */
+            if (skip_ascii_ws(last + mlen) == think_end &&
+                (!strncmp(body, straddle_opens[oi].invoke, strlen(straddle_opens[oi].invoke)) ||
+                 !strncmp(body, straddle_opens[oi].close, strlen(straddle_opens[oi].close)))) {
+                style = straddle_opens[oi].style;
+                straddle = true;
+                break;
+            }
+        }
+    }
+
+    if (!start && !straddle) {
         split_reasoning_content(text, strlen(text), content_out, reasoning_out);
         return true;
     }
 
-    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    size_t content_len = straddle
+        ? trim_tool_separator_ws(text, 0, (size_t)(think_end + 8 - text))
+        : trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
     const char *tool_calls_end = DS4_TOOL_CALLS_END;
@@ -4516,16 +4568,27 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         param_end = DS4_PARAM_END_SHORT;
     }
 
-    const char *p = strstr(start, tool_calls_start);
-    if (!p) return false;
-    p += strlen(tool_calls_start);
+    const char *p;
+    if (straddle) {
+        /* The opening lives before </think>; the body begins right after it. */
+        p = think_end + 8;
+    } else {
+        p = strstr(start, tool_calls_start);
+        if (!p) return false;
+        p += strlen(tool_calls_start);
+    }
 
     for (;;) {
         p = skip_ascii_ws(p);
         if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
             const char *raw_block_end = p + strlen(tool_calls_end);
             free(calls->raw_dsml);
-            calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
+            /* Straddled stanza: opening is on the far side of </think>, so a
+             * contiguous raw capture would embed </think>.  Leave raw_dsml NULL and
+             * let append_dsml_tool_calls_text re-synthesize from the parsed calls. */
+            calls->raw_dsml = straddle
+                ? NULL
+                : xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
             split_reasoning_content(text, content_len, content_out, reasoning_out);
             return true;
         }
