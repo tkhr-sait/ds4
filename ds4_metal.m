@@ -8749,7 +8749,16 @@ void ds4_gpu_stream_nommap_persist_clear(void) {
         g_stream_nommap_persist_resset = nil;
     }
 #endif
-    for (uint32_t i = 0; i < g_stream_nommap_persist_count; i++) g_stream_nommap_persist[i].buffer = nil;
+    for (uint32_t i = 0; i < g_stream_nommap_persist_count; i++) {
+        /* Releasing a Shared MTLBuffer alone leaves its pages resident in Metal's
+         * allocator pool (same hazard the slab teardown handles, ~line 10127):
+         * across repeated engine open/close the 8.22 GiB persist tier would
+         * otherwise accumulate as a wired high-watermark.  Force the pages back to
+         * the OS first.  Safe here: the caller (cleanup) has drained all command
+         * buffers, so the persist contents are dead. */
+        [g_stream_nommap_persist[i].buffer setPurgeableState:MTLPurgeableStateEmpty];
+        g_stream_nommap_persist[i].buffer = nil;
+    }
     g_stream_nommap_persist_count = 0;
     g_stream_nommap_persist_bytes = 0;
 }
@@ -8828,6 +8837,10 @@ static void ds4_gpu_stream_nommap_routed_free(void) {
     }
     ds4_gpu_stream_nommap_routed_resset_teardown();
     for (uint32_t i = 0; i < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; i++) {
+        /* Force the ~2 GiB/layer owned expert buffers back to the OS rather than
+         * leaving them resident in Metal's pool (see persist_clear / slab notes).
+         * Drained above, so the contents are dead. */
+        [g_stream_nommap_routed[i].buffer setPurgeableState:MTLPurgeableStateEmpty];
         g_stream_nommap_routed[i].buffer       = nil;
         g_stream_nommap_routed[i].model_offset = 0;
         g_stream_nommap_routed[i].bytes        = 0;
@@ -11270,6 +11283,25 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
     for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        if (g_stream_expert_cache_slabs[i]) {
+            /* munlock the slab's pages first: per-slot mlock (slab_lock_slot) is
+             * never undone by clear_entry_internal (it only recycles the slot), so
+             * the slab teardown must drop the locks here.  setPurgeableStateEmpty
+             * cannot reclaim still-locked pages, so without this the wired cache
+             * would persist across engine open/close. */
+            void *contents = [g_stream_expert_cache_slabs[i] contents];
+            const NSUInteger slab_len = [g_stream_expert_cache_slabs[i] length];
+            if (contents && slab_len != 0) {
+                (void)munlock(contents, (size_t)slab_len);
+            }
+            /* Return the pages to the OS for real: releasing the buffer alone
+             * leaves its memory in Metal's allocator pool as resident
+             * anonymous pages (observed: 13.3 GiB of freed prefill slabs
+             * surviving the release and getting compressed at gen start,
+             * lingering in the compressor through the whole gen).  All
+             * callers sit at sync points, so the contents are dead. */
+            [g_stream_expert_cache_slabs[i] setPurgeableState:MTLPurgeableStateEmpty];
+        }
         g_stream_expert_cache_slabs[i] = nil;
         g_stream_expert_cache_slab_start_slot[i] = 0;
         g_stream_expert_cache_slab_slot_count[i] = 0;
@@ -30682,6 +30714,214 @@ int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n
     return 1;
 }
 
+/* DS4_METAL_ENABLE_STREAMING_NO_MMAP + --quality decode path.
+ *
+ * The fused slots6/addr streaming kernels are !g_quality_mode-only, so under
+ * --quality ds4_gpu_routed_moe_one_tensor otherwise falls back to wrapping the
+ * WHOLE routed-expert tensors with ds4_gpu_wrap_model_range.  With no mmap there
+ * is nothing to wrap (model->map is only the ~64 MiB metadata buffer and the
+ * routed double-buffer tier is prefill-only / released before gen), so the wrap
+ * returned nil -- "Metal model range ... is not covered by mapped model views" --
+ * and decode produced garbage.
+ *
+ * Serve the selected experts from the SAME per-expert pread cache the fast path
+ * uses (ds4_gpu_stream_expert_cache_get loads on miss via the no-cache fd and the
+ * cache owns residency), then run the exact (non-fused) quality compute, mirroring
+ * the residency-lru non-fused fallback: per-expert gate/up mul_mv_id -> SwiGLU +
+ * route weight -> per-expert down mul_mv_id -> sum.  Returns 1 on success, 0 to
+ * let the caller error out (the gate guarantees the cache is usable, so 0 is a
+ * genuine failure, not a quant/shape mismatch). */
+static int ds4_gpu_routed_moe_one_tensor_stream_quality(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        float                 clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t              layer_index) {
+    const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
+    const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
+    id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
+    id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+    if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf        = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gatebuf     = ds4_gpu_tensor_buffer(gate);
+        id<MTLBuffer> upbuf       = ds4_gpu_tensor_buffer(up);
+        id<MTLBuffer> midbuf      = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf      = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> expertsbuf  = ds4_gpu_tensor_buffer(experts);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf  = ds4_gpu_tensor_buffer(weights);
+        const uint64_t x_bytes   = (uint64_t)expert_in_dim * sizeof(float);
+        const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+        if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !selectedbuf || !weightsbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(gate) < mid_bytes ||
+            ds4_gpu_tensor_bytes(up) < mid_bytes ||
+            ds4_gpu_tensor_bytes(mid) < mid_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert * sizeof(int) ||
+            ds4_gpu_tensor_bytes(weights) < (uint64_t)n_expert * sizeof(float)) {
+            fprintf(stderr, "ds4: streaming quality MoE received undersized activation buffers\n");
+            return 0;
+        }
+        if (n_expert > 1 &&
+            (!expertsbuf ||
+             ds4_gpu_tensor_bytes(experts) < (uint64_t)n_expert * out_dim * sizeof(float))) {
+            fprintf(stderr, "ds4: streaming quality MoE received undersized expert output buffer\n");
+            return 0;
+        }
+
+        const uint32_t n_tokens = 1;
+        const uint32_t pair_rows = n_tokens * n_expert;
+        const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
+        const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+        const NSUInteger sel_off        = ds4_gpu_tensor_offset(selected);
+        const NSUInteger x_off          = ds4_gpu_tensor_offset(x);
+        const NSUInteger gate_base_off  = ds4_gpu_tensor_offset(gate);
+        const NSUInteger up_base_off    = ds4_gpu_tensor_offset(up);
+        const NSUInteger mid_base_off   = ds4_gpu_tensor_offset(mid);
+        const NSUInteger out_off        = ds4_gpu_tensor_offset(out);
+        const NSUInteger weights_off    = ds4_gpu_tensor_offset(weights);
+        const NSUInteger row_stride     = (NSUInteger)expert_mid_dim * sizeof(float);
+        const NSUInteger out_row_stride = (NSUInteger)out_dim * sizeof(float);
+
+        /* Read back the GPU-selected expert ids: needed CPU-side to pread the
+         * matching experts into the cache (mirrors the fast slots readback). */
+        int32_t selected_ids[6] = { 0, 0, 0, 0, 0, 0 };
+        if (g_batch_cb != nil) {
+            if (ds4_gpu_end_commands() == 0) return 0;
+            if (ds4_gpu_tensor_read(selected, 0, selected_ids,
+                                    (uint64_t)n_expert * sizeof(selected_ids[0])) == 0) {
+                return 0;
+            }
+            if (ds4_gpu_begin_commands() == 0) return 0;
+        } else if (ds4_gpu_tensor_read(selected, 0, selected_ids,
+                                       (uint64_t)n_expert * sizeof(selected_ids[0])) == 0) {
+            return 0;
+        }
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
+                fprintf(stderr,
+                        "ds4: streaming quality MoE selected expert id %d outside 0..%u\n",
+                        selected_ids[i], n_total_expert);
+                return 0;
+            }
+        }
+
+        /* Serve each selected expert from the per-expert pread cache (loads on
+         * miss via the no-cache fd), exactly like the fast streaming decode. */
+        id<MTLBuffer> e_gate[6], e_up[6], e_down[6];
+        NSUInteger e_gate_inner[6], e_up_inner[6], e_down_inner[6];
+        for (uint32_t i = 0; i < n_expert; i++) {
+            const uint32_t expert = (uint32_t)selected_ids[i];
+            const uint64_t g_off = gate_offset + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t u_off = up_offset   + (uint64_t)expert * gate_expert_bytes;
+            const uint64_t d_off = down_offset + (uint64_t)expert * down_expert_bytes;
+            ds4_gpu_stream_expert_cache_entry *e =
+                ds4_gpu_stream_expert_cache_get(model_map, model_size, layer_index,
+                                                expert, n_total_expert, n_expert,
+                                                g_off, u_off, d_off,
+                                                gate_expert_bytes, down_expert_bytes);
+            if (!e || !e->gate_buffer || !e->up_buffer || !e->down_buffer) return 0;
+            e_gate[i] = e->gate_buffer; e_gate_inner[i] = e->gate_inner;
+            e_up[i]   = e->up_buffer;   e_up_inner[i]   = e->up_inner;
+            e_down[i] = e->down_buffer; e_down_inner[i] = e->down_inner;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        int ok = 1;
+
+        /* Per-expert single-slot dispatch (nei0=1, src1_expert_rows=1, nb02=0 so
+         * the per-expert buffer base is used directly) -> exact quality math. */
+        ds4_gpu_mul_mv_id_args gate_args =
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                        gate_row_bytes, gate_expert_bytes,
+                                        1, 1, n_tokens, gate_nr0);
+        gate_args.nb02 = 0;
+        ds4_gpu_mul_mv_id_args down_args =
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                        down_row_bytes, down_expert_bytes,
+                                        1, 1, n_tokens, down_nr0);
+        down_args.nb02 = 0;
+
+        /* Gate + up: one single-slot dispatch per selected expert -> row i. */
+        for (uint32_t i = 0; ok && i < n_expert; i++) {
+            ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                          e_gate[i], e_gate_inner[i],
+                                          xbuf, x_off,
+                                          gatebuf, gate_base_off + (NSUInteger)i * row_stride,
+                                          selectedbuf, sel_off,
+                                          gate_smem, 2, false);
+            if (ok) {
+                ok = ds4_gpu_encode_mul_mv_id(cb, gate_mv_pipeline, &gate_args,
+                                              e_up[i], e_up_inner[i],
+                                              xbuf, x_off,
+                                              upbuf, up_base_off + (NSUInteger)i * row_stride,
+                                              selectedbuf, sel_off,
+                                              gate_smem, 2, false);
+            }
+        }
+        /* SwiGLU + route weight over all rows (existing kernel, unchanged). */
+        if (ok) {
+            ok = ds4_gpu_encode_moe_swiglu_weight(cb,
+                                                  gatebuf, gate_base_off,
+                                                  upbuf, up_base_off,
+                                                  midbuf, mid_base_off,
+                                                  weightsbuf, weights_off,
+                                                  expert_mid_dim, pair_rows, clamp, false);
+        }
+        /* Down: one single-slot dispatch per expert reading mid row i.  For
+         * n_expert == 1 write straight to out; otherwise per-expert rows + sum. */
+        id<MTLBuffer> down_dst      = (n_expert == 1) ? outbuf : expertsbuf;
+        NSUInteger    down_dst_base = (n_expert == 1) ? out_off
+                                                      : ds4_gpu_tensor_offset(experts);
+        for (uint32_t i = 0; ok && i < n_expert; i++) {
+            ok = ds4_gpu_encode_mul_mv_id(cb, down_mv_pipeline, &down_args,
+                                          e_down[i], e_down_inner[i],
+                                          midbuf, mid_base_off + (NSUInteger)i * row_stride,
+                                          down_dst, down_dst_base + (NSUInteger)i * out_row_stride,
+                                          selectedbuf, sel_off,
+                                          down_smem, 2, false);
+        }
+        if (ok && n_expert > 1) {
+            ok = ds4_gpu_encode_moe_sum_experts(cb,
+                                                expertsbuf, ds4_gpu_tensor_offset(experts),
+                                                outbuf, out_off,
+                                                out_dim, n_expert, n_tokens);
+        }
+        if (!ok) return 0;
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "routed quality stream MoE")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -30720,6 +30960,29 @@ int ds4_gpu_routed_moe_one_tensor(
     }
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
     ds4_gpu_stream_expert_cache_note_token(layer_index);
+
+    /* DS4_METAL_ENABLE_STREAMING_NO_MMAP + --quality: the fused slots6/addr
+     * streaming kernels are !quality-only and the generic quality path wraps whole
+     * expert tensors via ds4_gpu_wrap_model_range, which has no backing with no
+     * mmap.  Serve experts from the per-expert pread cache + exact (non-fused)
+     * compute instead.  Scoped to no-mmap so mmap-streaming quality (whose
+     * whole-tensor wrap works) is untouched. */
+    if (g_quality_mode && g_ssd_streaming_mode && g_stream_nommap_fd >= 0 &&
+        n_expert >= 1 && n_expert <= 6 &&
+        ds4_gpu_routed_mv_pipeline(gate_type) != nil &&
+        ds4_gpu_routed_mv_pipeline(down_type) != nil &&
+        ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                     down_expert_bytes) &&
+        ds4_gpu_stream_expert_cache_effective_cap(layer_index,
+                                                  n_total_expert,
+                                                  n_expert) != 0) {
+        return ds4_gpu_routed_moe_one_tensor_stream_quality(
+            out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, layer_index);
+    }
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
