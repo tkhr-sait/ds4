@@ -85,6 +85,28 @@ int ds4_gpu_stream_nommap_routed_prefetch(uint64_t model_size,
 /* End-of-prompt: free the routed prefill double-buffer so it does not stay wired
  * through gen.  Lazily re-allocated by the next prefill.  No-op if unallocated. */
 void ds4_gpu_stream_nommap_routed_release(void);
+/* Prefill-start hook for the in-place double-buffer reuse (ALWAYS ON for nommap
+ * streaming, no env toggle): the 6 whole-tensor DBs live in dedicated gen cache
+ * slabs instead of separate per-prompt allocations.  Sizes/reserves the
+ * DB slabs from the model shape (per-expert bytes x n_total_expert).  Returns 1
+ * when the in-place path is engaged (caller then ends the prompt via
+ * db_end_prefill, NOT routed_release); returns 0 to use the legacy
+ * separate-buffer DB (reuse OFF, whole-tensor >= 2GiB pro, or alloc failure). */
+int  ds4_gpu_stream_nommap_db_begin_prefill(uint64_t gate_expert_bytes,
+                                            uint64_t down_expert_bytes,
+                                            uint32_t n_total_expert);
+/* Prefill-end hook for the in-place DB reuse: returns the DB slabs to the gen
+ * cache (gen re-warms them) without freeing.  No-op when reuse is OFF. */
+void ds4_gpu_stream_nommap_db_end_prefill(void);
+/* End-of-prompt routed-DB release that dispatches by what this prompt used: the
+ * in-place DB path (db_end_prefill, keeps the slabs) when DB reuse was engaged,
+ * else the legacy separate-buffer routed_release.  Use at the prefill->gen
+ * boundary in place of routed_release(). */
+void ds4_gpu_stream_nommap_routed_end_prefill(void);
+/* 1 while an in-place DB reservation is held this prompt; lets the chunked-prefill
+ * error/cancel early-returns release it only when actually engaged (so the
+ * default reuse-OFF path is byte-for-byte unchanged). */
+int  ds4_gpu_stream_nommap_db_reuse_engaged(void);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);

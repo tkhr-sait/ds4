@@ -376,6 +376,8 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
+static int ds4_gpu_nommap_db_slot_is_db_role(uint32_t slot);   /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE */
+static int ds4_gpu_nommap_db_reuse_enabled(void);              /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE */
 static void ds4_gpu_stream_nommap_routed_free(void);   /* DS4_METAL_ENABLE_STREAMING_NO_MMAP prefill routed tier */
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
@@ -554,6 +556,24 @@ static uint32_t g_stream_expert_cache_slab_total_slots;
 static uint32_t g_stream_expert_cache_free_slots[DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES];
 static uint32_t g_stream_expert_cache_free_slot_count;
 static uint64_t g_stream_expert_cache_slab_slot_bytes;
+/* In-place prefill DB reuse (ALWAYS ON for nommap streaming, no env toggle):
+ * the nommap prefill routed double-buffer (whole gate/up/down expert
+ * tensors) is NOT a separate MTLBuffer allocation freed per prompt (which macOS
+ * never returns to the OS, overshooting fixed+budget); instead each whole-tensor
+ * lives at byte 0 of its
+ * OWN dedicated slab that is part of the gen streaming-expert-cache slab array.
+ * During gen those slabs are ordinary gen slots (so gen keeps the FULL budget);
+ * during prefill they are temporally repurposed to hold the whole-tensors.
+ * g_stream_expert_cache_slab_db_role[i] == 1 marks a slab as a DB slab;
+ * g_nommap_db_slab_idx[s] (s in 0..5 == parity*3 + {gate,up,down}) is that DB
+ * tensor's slab index in the slab array (-1 = not yet allocated);
+ * g_nommap_db_in_use == 1 while a prefill owns the DB slabs as whole-tensors. */
+static uint8_t  g_stream_expert_cache_slab_db_role[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static int      g_nommap_db_slab_idx[6];       /* == DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS */
+static int      g_nommap_db_slab_idx_init;     /* 0 until g_nommap_db_slab_idx[] seeded to -1 */
+static int      g_nommap_db_in_use;
+static int      g_nommap_db_reuse_logged;      /* one-time "reuse: ON" stderr line */
+static int      g_nommap_db_pro_fallback_logged; /* one-time ">=2GiB legacy DB" line */
 static uint64_t g_stream_expert_cache_cb_seq;
 static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
@@ -8798,6 +8818,10 @@ void ds4_gpu_stream_nommap_persist_clear(void) {
  * end_commands drains its GEMM before the next-but-one layer reuses its parity
  * set, so a background refill never aliases a live GEMM's buffers. */
 #define DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS 6
+/* g_nommap_db_slab_idx[] (declared near the slab globals, before this macro is in
+ * scope) is sized to a literal 6; keep it in lock-step with the routed slot count. */
+_Static_assert(DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS == 6,
+               "g_nommap_db_slab_idx[] must match DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS");
 static ds4_gpu_stream_nommap_view g_stream_nommap_routed[DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS];
 static id             g_stream_nommap_routed_resset;   /* id<MTLResidencySet>, macOS 15+; current layer's set */
 
@@ -8836,15 +8860,36 @@ static void ds4_gpu_stream_nommap_routed_free(void) {
         g_stream_nommap_routed_pf[p].err         = 0;
     }
     ds4_gpu_stream_nommap_routed_resset_teardown();
+    const int reuse = ds4_gpu_nommap_db_reuse_enabled();
     for (uint32_t i = 0; i < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; i++) {
-        /* Force the ~2 GiB/layer owned expert buffers back to the OS rather than
-         * leaving them resident in Metal's pool (see persist_clear / slab notes).
-         * Drained above, so the contents are dead. */
-        [g_stream_nommap_routed[i].buffer setPurgeableState:MTLPurgeableStateEmpty];
+        /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE: a DB-slab buffer parked in this slot is
+         * owned by the gen cache (g_stream_expert_cache_slabs) -- it must NOT be
+         * purged or nil'd here; that would destroy a live gen slab.  Only zero the
+         * view metadata so wrap_model_range stops matching it outside prefill. */
+        int is_db_buf = 0;
+        if (reuse && g_nommap_db_slab_idx[i] >= 0) {
+            const uint32_t slab = (uint32_t)g_nommap_db_slab_idx[i];
+            if (slab < g_stream_expert_cache_slab_count &&
+                g_stream_nommap_routed[i].buffer == g_stream_expert_cache_slabs[slab]) {
+                is_db_buf = 1;
+            }
+        }
+        if (!is_db_buf) {
+            /* Legacy owned buffer (reuse OFF, or a mixed-precision fall-back
+             * allocation): force its ~2 GiB/layer pages back to the OS rather than
+             * leaving them resident in Metal's pool (see persist_clear / slab
+             * notes).  Drained above, so the contents are dead. */
+            [g_stream_nommap_routed[i].buffer setPurgeableState:MTLPurgeableStateEmpty];
+        }
         g_stream_nommap_routed[i].buffer       = nil;
         g_stream_nommap_routed[i].model_offset = 0;
         g_stream_nommap_routed[i].bytes        = 0;
     }
+    /* In the reuse path the per-prompt boundary goes through db_end_prefill (which
+     * keeps the DB slabs); _free here is the engine-close / legacy teardown, so
+     * mark the DB as not in use.  (db_end_prefill already did this for the warm
+     * per-prompt path.) */
+    if (reuse) g_nommap_db_in_use = 0;
 }
 
 /* Public end-of-prompt release: drop the routed prefill double-buffer (owned
@@ -8917,16 +8962,37 @@ static int ds4_gpu_stream_nommap_routed_issue(uint64_t model_size,
         const uint64_t page_off = offs[i] & ~(page - 1);
         const uint64_t leading  = offs[i] - page_off;
         const uint64_t len      = round_up_u64(leading + lens[i], page);
-        id<MTLBuffer> buf = g_stream_nommap_routed[s].buffer;
-        if (!buf || (uint64_t)buf.length < len) {
-            buf = [g_device newBufferWithLength:(NSUInteger)len
-                                        options:MTLResourceStorageModeShared];
-            if (!buf) {
-                if (submitted) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
-                p->in_flight = 0; p->loaded = 0;
-                return 0;
+        /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE: when this prefill owns the DB slabs,
+         * pread the whole-tensor into slot s's dedicated DB slab at byte 0 instead
+         * of allocating a fresh (orphan-on-free) buffer.  The slab was sized to
+         * cover len (tensor_bytes + one page of leading slack); if it somehow is
+         * not (mixed precision), fall through to the legacy buffer below so the
+         * read still succeeds rather than overrunning the slab. */
+        id<MTLBuffer> buf = nil;
+        if (g_nommap_db_in_use && g_nommap_db_slab_idx[s] >= 0) {
+            const uint32_t slab = (uint32_t)g_nommap_db_slab_idx[s];
+            if (slab < g_stream_expert_cache_slab_count) {
+                id<MTLBuffer> db = g_stream_expert_cache_slabs[slab];
+                if (db && (uint64_t)db.length >= len) buf = db;
             }
-            g_stream_nommap_routed[s].buffer = buf;   /* ARC releases any smaller old one */
+        }
+        if (buf) {
+            /* DB slab is what wrap_model_range must resolve for this slot.  Store
+             * it (dropping any legacy owned buffer ARC-held here so it is not
+             * double-counted while the DB slab is in use). */
+            g_stream_nommap_routed[s].buffer = buf;
+        } else {
+            buf = g_stream_nommap_routed[s].buffer;
+            if (!buf || (uint64_t)buf.length < len) {
+                buf = [g_device newBufferWithLength:(NSUInteger)len
+                                            options:MTLResourceStorageModeShared];
+                if (!buf) {
+                    if (submitted) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+                    p->in_flight = 0; p->loaded = 0;
+                    return 0;
+                }
+                g_stream_nommap_routed[s].buffer = buf;   /* ARC releases any smaller old one */
+            }
         }
         uint64_t want = len;
         if (page_off + want > model_size) want = model_size - page_off;
@@ -10020,6 +10086,20 @@ static int ds4_gpu_stream_expert_slab_enabled(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS") == NULL;
 }
 
+/* The nommap prefill DB in-place reuse is ALWAYS ON for nommap streaming -- no
+ * dedicated env toggle (Mac-verified: it avoids the separate per-prompt routed
+ * double-buffer that macOS never returns to the OS = overshoot + orphan, keeps
+ * gen at full budget, no regression).  It self-gates to the safe scope: only the
+ * nommap whole-tensor prefill path engages it, q2-PRO (>=2GiB) auto-falls back to
+ * the legacy separate-buffer DB, and residency-LRU is excluded (see the ds4.c
+ * begin_prefill gate).  It requires the slab allocator since the DB slabs ARE gen
+ * cache slabs; disabling slabs (DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS) is the
+ * only way to fall back to the legacy buffers, and that is a prerequisite gate,
+ * not a DB-reuse toggle. */
+static int ds4_gpu_nommap_db_reuse_enabled(void) {
+    return ds4_gpu_stream_expert_slab_enabled();
+}
+
 /*
  * Large PRO caches otherwise create thousands of small shared Metal buffers.
  * Slabs keep the buffer object set small while locking pages only for slots
@@ -10176,23 +10256,50 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     g_stream_expert_cache_slab_slot_bytes = slot_bytes;
 
     if (g_stream_expert_cache_free_slot_count != 0) {
-        const uint32_t slot =
-            g_stream_expert_cache_free_slots[--g_stream_expert_cache_free_slot_count];
-        return ds4_gpu_stream_expert_slab_slot_buffers(slot,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes,
-                                                       gate_buf,
-                                                       up_buf,
-                                                       down_buf,
-                                                       gate_inner,
-                                                       up_inner,
-                                                       down_inner);
+        /* While a prefill owns the DB slabs (db reuse ON), a free-pool slot that
+         * belongs to a DB-role slab must NOT be handed to gen -- the whole-tensor
+         * occupies that region.  Pop from the top while the top is a DB slot;
+         * if the whole pool is DB slots, fall through to the new/last-slab path
+         * (the DB slabs are excluded there too).  When db_in_use is 0 (gen) this
+         * loop is a no-op and the original single pop runs. */
+        uint32_t take = g_stream_expert_cache_free_slot_count;
+        if (g_nommap_db_in_use) {
+            while (take != 0 &&
+                   ds4_gpu_nommap_db_slot_is_db_role(
+                       g_stream_expert_cache_free_slots[take - 1])) {
+                take--;
+            }
+        }
+        if (take != 0) {
+            const uint32_t slot = g_stream_expert_cache_free_slots[take - 1];
+            /* Remove `slot` from the pool, shifting the (DB) tail down by one. */
+            for (uint32_t k = take - 1; k + 1 < g_stream_expert_cache_free_slot_count; k++) {
+                g_stream_expert_cache_free_slots[k] =
+                    g_stream_expert_cache_free_slots[k + 1];
+            }
+            g_stream_expert_cache_free_slot_count--;
+            return ds4_gpu_stream_expert_slab_slot_buffers(slot,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes,
+                                                           gate_buf,
+                                                           up_buf,
+                                                           down_buf,
+                                                           gate_inner,
+                                                           up_inner,
+                                                           down_inner);
+        }
     }
 
     uint32_t slab = g_stream_expert_cache_slab_count;
     if (slab != 0 &&
         g_stream_expert_cache_slab_slots_used[slab - 1] <
-            g_stream_expert_cache_slab_slot_count[slab - 1]) {
+            g_stream_expert_cache_slab_slot_count[slab - 1] &&
+        /* A DB-role slab is NEVER grown into via slots_used: its slots are handed
+         * to gen EXCLUSIVELY through the free pool (db_end_reserve pushes the whole
+         * region there).  Growing it here too would double-allocate the same slot
+         * (grow path + free-pool pop).  Unconditional (not just while db_in_use)
+         * so the last slab being a DB slab can never be grown during gen either. */
+        !g_stream_expert_cache_slab_db_role[slab - 1]) {
         slab--;
     } else {
         if (g_stream_expert_cache_slab_count >=
@@ -11254,6 +11361,399 @@ static void ds4_gpu_stream_expert_cache_clear_entry(
                                                      NULL);
 }
 
+/* ---- DS4_METAL_ENABLE_NOMMAP_DB_REUSE: in-place prefill double-buffer ----------
+ *
+ * The 6 prefill double-buffer whole-tensors live IN dedicated gen slabs (one per
+ * tensor, each sized to that whole-tensor, page-rounded) that are members of the
+ * gen streaming-expert-cache slab array.  They count in slab_total_slots so gen
+ * gets the FULL budget, and they are NEVER freed (no orphan, total == budget).
+ * While a prefill owns them (g_nommap_db_in_use) the slab allocator excludes
+ * them; on return they become ordinary gen slots and gen re-warms them. */
+
+static void ds4_gpu_nommap_db_slab_idx_init(void) {
+    if (g_nommap_db_slab_idx_init) return;
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        g_nommap_db_slab_idx[s] = -1;
+    }
+    g_nommap_db_slab_idx_init = 1;
+}
+
+/* 1 if global slot `slot` resides in a DB-role slab (i.e. one of the 6 prefill
+ * whole-tensor slabs); used to exclude such slots from gen allocation. */
+static int ds4_gpu_nommap_db_slot_is_db_role(uint32_t slot) {
+    uint32_t slab = UINT32_MAX;
+    if (!ds4_gpu_stream_expert_slab_slot_range(slot, &slab, NULL)) return 0;
+    if (slab >= g_stream_expert_cache_slab_count) return 0;
+    return g_stream_expert_cache_slab_db_role[slab] != 0;
+}
+
+/* Compute the frozen slot byte size (same formula as alloc_slab_slot @~9050)
+ * from per-expert bytes.  Used to size DB-slab slot_count at cold start, when
+ * g_stream_expert_cache_slab_slot_bytes is still 0 (no gen slab exists yet). */
+static uint64_t ds4_gpu_nommap_db_slot_bytes(uint64_t gate_expert_bytes,
+                                             uint64_t down_expert_bytes) {
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        return 0;
+    }
+    uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page != 0) slot_bytes = round_up_u64(slot_bytes, page);
+    if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
+    return slot_bytes;
+}
+
+/* Lazily allocate the 6 DB slabs (idempotent).  Each slab is sized to the
+ * whole-tensor it backs (gate/up == gate_tensor_bytes, down == down_tensor_bytes,
+ * page-rounded) so the whole-tensor sits at byte 0 (inner_offset==0 -> no >=2GiB
+ * grouped-GEMM misread) and the slab is also carved into floor(slab/slot_bytes)
+ * gen slots during decode.  Sizes come from the caller's actual model bytes.
+ * Returns 1 if all 6 DB slabs exist, 0 on any failure (caller falls back to the
+ * legacy separate-buffer DB). */
+static int ds4_gpu_nommap_db_ensure_slabs(uint64_t gate_tensor_bytes,
+                                          uint64_t down_tensor_bytes,
+                                          uint64_t gate_expert_bytes,
+                                          uint64_t down_expert_bytes) {
+    ds4_gpu_nommap_db_slab_idx_init();
+    /* All 6 already allocated? */
+    int all_done = 1;
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        if (g_nommap_db_slab_idx[s] < 0) { all_done = 0; break; }
+    }
+    if (all_done) return 1;
+
+    if (gate_tensor_bytes == 0 || down_tensor_bytes == 0) return 0;
+
+    const uint64_t slot_bytes =
+        ds4_gpu_nommap_db_slot_bytes(gate_expert_bytes, down_expert_bytes);
+    if (slot_bytes == 0) return 0;
+    /* The cache is a single-size-class slab allocator; freeze the slot byte size
+     * (matching alloc_slab_slot's invariant) so the DB slabs' slots are
+     * interchangeable with ordinary gen slots.  If a gen slab already fixed a
+     * different size, the model is mixed-size and we must not adopt these slabs. */
+    if (g_stream_expert_cache_slab_slot_bytes != 0 &&
+        g_stream_expert_cache_slab_slot_bytes != slot_bytes) {
+        return 0;
+    }
+
+    const uint64_t page = (uint64_t)getpagesize();
+    /* All-or-nothing build: record the slab-array state so a mid-loop failure
+     * (alloc OOM / overflow / the MAX_ENTRIES guard) can be fully unwound.  A
+     * PARTIAL build would leave db_role slabs that gen can never grow into and
+     * that begin/end_reserve (db_in_use never set) never push to the free pool ->
+     * stranded GPU memory + a gen budget shrunk by the rejected permanent
+     * reservation.  The DB slabs created here are a contiguous tail
+     * [start_slab_count, slab_count). */
+    const uint32_t start_slab_count  = g_stream_expert_cache_slab_count;
+    const uint32_t start_total_slots = g_stream_expert_cache_slab_total_slots;
+    int failed = 0;
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        if (g_nommap_db_slab_idx[s] >= 0) continue;   /* already built */
+        if (g_stream_expert_cache_slab_count >=
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
+            failed = 1; break;
+        }
+        /* s in {0,3} == gate, {1,4} == up (both gate_tensor_bytes), {2,5} == down. */
+        const uint32_t which = s % 3u;   /* 0 gate, 1 up, 2 down */
+        uint64_t tensor_bytes =
+            (which == 2u) ? down_tensor_bytes : gate_tensor_bytes;
+        /* _issue() preads the page-aligned span covering [abs_offset, +tensor_bytes)
+         * into this slab at byte 0; its required length is round_up(leading +
+         * tensor_bytes, page) with leading = abs_offset % page in [0,page-1].  The
+         * worst case over all leading is round_up(tensor_bytes, page) + page, so
+         * reserve exactly that (>= every possible len) -- guaranteeing _issue's
+         * "buf.length < len" separate-orphan-buffer fallback never fires (that
+         * fallback would reintroduce the overshoot this design eliminates). */
+        uint64_t need_bytes;
+        if (page != 0) {
+            if (tensor_bytes > UINT64_MAX - 2ull * page) { failed = 1; break; }
+            need_bytes = round_up_u64(tensor_bytes, page) + page;
+        } else {
+            need_bytes = tensor_bytes;
+        }
+        /* Round the slot count UP so slots*slot_bytes covers need_bytes and the
+         * slab is a whole number of gen slots (>= 1). */
+        if (need_bytes > UINT64_MAX - (slot_bytes - 1)) { failed = 1; break; }
+        uint64_t slots64 = (need_bytes + slot_bytes - 1) / slot_bytes;  /* ceil */
+        if (slots64 == 0) slots64 = 1;
+        if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
+        const uint32_t slots = (uint32_t)slots64;
+        /* Defensive bound: the gen grow path caps slot growth against budget, but
+         * DB slabs bypass that (the whole-tensors are mandatory).  Slot indices
+         * must stay < MAX_ENTRIES so free_slots[] never indexes
+         * out of bounds or silently drop in push_free_slot.  For the real flash
+         * model the 6 DB slabs total ~516 slots << 23424, so this never fires; it
+         * guards only the pathological large-budget/many-expert or
+         * gen-grew-before-first-prefill case.  Bound is MAX_ENTRIES, NOT budget:
+         * for budget < DB_slots, in-place reuse (total == DB_slots) is still
+         * strictly smaller than the legacy separate-buffer DB (budget + DB_slots),
+         * so we must not refuse it merely for being over budget. */
+        if ((uint64_t)g_stream_expert_cache_slab_total_slots + (uint64_t)slots >
+            (uint64_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+            failed = 1; break;
+        }
+        if ((uint64_t)slots > UINT64_MAX / slot_bytes) { failed = 1; break; }
+        const uint64_t alloc_bytes = (uint64_t)slots * slot_bytes;
+        if (alloc_bytes < need_bytes ||
+            alloc_bytes > (uint64_t)NSUIntegerMax) {
+            failed = 1; break;
+        }
+        id<MTLBuffer> slab_buffer =
+            ds4_gpu_stream_expert_alloc_slab_buffer(alloc_bytes,
+                                                    @"ds4_stream_nommap_db_slab");
+        if (!slab_buffer) { failed = 1; break; }
+
+        g_stream_expert_cache_slab_slot_bytes = slot_bytes;   /* freeze size class */
+        const uint32_t slab = g_stream_expert_cache_slab_count++;
+        g_stream_expert_cache_slabs[slab] = slab_buffer;
+        g_stream_expert_cache_slab_start_slot[slab] =
+            g_stream_expert_cache_slab_total_slots;
+        g_stream_expert_cache_slab_slot_count[slab] = slots;
+        g_stream_expert_cache_slab_slots_used[slab] = 0;
+        g_stream_expert_cache_slab_db_role[slab] = 1;
+        g_stream_expert_cache_slab_total_slots += slots;
+        g_nommap_db_slab_idx[s] = (int)slab;
+    }
+
+    if (failed) {
+        /* Unwind every DB slab appended in THIS call and restore the pre-call
+         * state, so the slab array is left exactly as ensure_slabs found it. */
+        for (uint32_t sl = start_slab_count;
+             sl < g_stream_expert_cache_slab_count; sl++) {
+            if (g_stream_expert_cache_slabs[sl]) {
+                [g_stream_expert_cache_slabs[sl]
+                    setPurgeableState:MTLPurgeableStateEmpty];
+                g_stream_expert_cache_slabs[sl] = nil;
+            }
+            g_stream_expert_cache_slab_db_role[sl]    = 0;
+            g_stream_expert_cache_slab_slot_count[sl] = 0;
+            g_stream_expert_cache_slab_slots_used[sl] = 0;
+            g_stream_expert_cache_slab_start_slot[sl] = 0;
+        }
+        g_stream_expert_cache_slab_count       = start_slab_count;
+        g_stream_expert_cache_slab_total_slots = start_total_slots;
+        for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+            if (g_nommap_db_slab_idx[s] >= (int)start_slab_count) {
+                g_nommap_db_slab_idx[s] = -1;
+            }
+        }
+        return 0;
+    }
+
+    if (!g_nommap_db_reuse_logged) {
+        fprintf(stderr,
+                "ds4: nommap DB in-place reuse: ON (db slabs sized "
+                "gate/up %.2f GiB x4, down %.2f GiB x2)\n",
+                ds4_gpu_gib(gate_tensor_bytes),
+                ds4_gpu_gib(down_tensor_bytes));
+        g_nommap_db_reuse_logged = 1;
+    }
+    return 1;
+}
+
+/* Reserve the DB slabs for the upcoming prefill (db_in_use 0->1):
+ *  - evict any gen entry whose slot lives in a DB-role slab (recycle=0: do NOT
+ *    push it to the free pool, it is the DB's now),
+ *  - drop any DB-slab slots already sitting in the free pool,
+ *  - reset each DB slab's slots_used so the whole-tensor owns the region.
+ * Idempotent (returns 1 if already in use).  Returns 0 WITHOUT mutating anything
+ * if a DB-slab gen entry is still GPU-in-flight (the caller then uses the legacy
+ * separate-buffer DB this prompt instead of corrupting the live expert). */
+static int ds4_gpu_nommap_db_begin_reserve(void) {
+    if (g_nommap_db_in_use) return 1;
+    /* Pre-scan (read-only, no mutation): the gen->prefill boundary is normally
+     * fully GPU-drained (decode reads logits per token, an implicit sync), so no
+     * DB-slab gen entry is in-flight here.  If one ever were, the eviction below
+     * (clear_entry_internal) would SKIP it -- leaving a live entry over the region
+     * the whole-tensor overwrites (corruption) and causing end_reserve + the later
+     * normal eviction to push the SAME slot to the free pool twice (double-use).
+     * Detect that and bail to the legacy DB rather than corrupt; nothing has been
+     * mutated yet, so the fallback is clean. */
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || !e->slab_backed) continue;
+            if (!ds4_gpu_nommap_db_slot_is_db_role(e->slab_slot)) continue;
+            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) return 0;
+        }
+    }
+    /* Safe: evict gen entries occupying DB-role slabs (guaranteed to fully clear,
+     * the pre-scan ruled out in-flight skips). */
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || !e->slab_backed) continue;
+            if (!ds4_gpu_nommap_db_slot_is_db_role(e->slab_slot)) continue;
+            /* recycle_slab_slot=0: the slot belongs to the DB now, not the free
+             * pool. */
+            ds4_gpu_stream_expert_cache_clear_entry_internal(layer, expert, 0, 0, NULL);
+        }
+    }
+    /* Compact the free pool, dropping any slot that maps to a DB-role slab. */
+    uint32_t w = 0;
+    for (uint32_t r = 0; r < g_stream_expert_cache_free_slot_count; r++) {
+        const uint32_t slot = g_stream_expert_cache_free_slots[r];
+        if (ds4_gpu_nommap_db_slot_is_db_role(slot)) continue;
+        g_stream_expert_cache_free_slots[w++] = slot;
+    }
+    g_stream_expert_cache_free_slot_count = w;
+    /* Hand the whole region of each DB slab back to the whole-tensor. */
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        if (g_nommap_db_slab_idx[s] < 0) continue;
+        const uint32_t slab = (uint32_t)g_nommap_db_slab_idx[s];
+        if (slab < g_stream_expert_cache_slab_count) {
+            g_stream_expert_cache_slab_slots_used[slab] = 0;
+        }
+    }
+    g_nommap_db_in_use = 1;
+    return 1;
+}
+
+/* Return the DB slabs to the gen cache (db_in_use 1->0).  Crucially this PUSHES
+ * every DB slab slot into the gen free pool so gen can allocate the WHOLE DB
+ * region (full budget) -- DB slabs are pool-only (the grow path never grows them,
+ * see alloc_slab_slot), so a slot reaches gen via the pool and only the pool, no
+ * double-allocation.
+ * Does NOT free the slabs.  Pre-state on entry: begin_reserve removed all DB
+ * slots from the pool and evicted DB-slab gen entries, and prefill (this phase)
+ * never pushes DB slots, so each DB slot is pushed here exactly once per cycle. */
+static void ds4_gpu_nommap_db_end_reserve(void) {
+    if (!g_nommap_db_in_use) return;
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        if (g_nommap_db_slab_idx[s] < 0) continue;
+        const uint32_t slab = (uint32_t)g_nommap_db_slab_idx[s];
+        if (slab >= g_stream_expert_cache_slab_count) continue;
+        g_stream_expert_cache_slab_slots_used[slab] = 0;   /* pool-only; kept 0 */
+        const uint32_t start = g_stream_expert_cache_slab_start_slot[slab];
+        const uint32_t count = g_stream_expert_cache_slab_slot_count[slab];
+        for (uint32_t local = 0; local < count; local++) {
+            const uint32_t slot = start + local;
+            /* Hand this DB slot to gen.  free_slots[] is sized MAX_ENTRIES, and
+             * ensure_slabs guarantees slab_total_slots <= MAX_ENTRIES (its
+             * defensive bound), so every DB slot index is < MAX_ENTRIES and
+             * push_free_slot never drops (no silent stranding).  NOTE: DB slots
+             * are NOT bounded by budget (the whole-tensors are mandatory), so
+             * slab_total_slots may exceed budget when budget < DB_slots. */
+            ds4_gpu_stream_expert_slab_push_free_slot(slot);
+        }
+    }
+    g_nommap_db_in_use = 0;
+}
+
+/* Public (ds4.c) prefill-start hook for the in-place DB reuse.  Idempotent.
+ * gate_expert_bytes/down_expert_bytes/n_total_expert come from the model shape at
+ * the call site (never hardcoded); the whole-tensor sizes are their products.
+ *
+ * Returns 1 if the DB slabs are ready and reserved (the caller does NOT then call
+ * the legacy separate-buffer release at end of prompt -- it calls db_end_prefill).
+ * Returns 0 to mean "use the legacy separate-buffer DB" -- because reuse is OFF,
+ * or because a whole-tensor is >= 2GiB (q2-PRO: an expert offset > 2GiB inside the
+ * bound buffer would misread in the grouped GEMM, so the DB must stay a separate
+ * <2GiB-or-irrelevant per-layer buffer; flash whole-tensors are ~0.5-0.7 GiB), or
+ * because the slabs could not be allocated. */
+int ds4_gpu_stream_nommap_db_begin_prefill(uint64_t gate_expert_bytes,
+                                           uint64_t down_expert_bytes,
+                                           uint32_t n_total_expert) {
+    if (!ds4_gpu_nommap_db_reuse_enabled()) return 0;
+    if (g_stream_nommap_fd < 0) return 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 || n_total_expert == 0) {
+        return 0;
+    }
+    if ((uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_tensor_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    /* PRO fallback: any whole-tensor >= 2 GiB re-triggers the >2GiB grouped-GEMM
+     * misread, so keep the legacy separate-buffer DB even with reuse env ON. */
+    const uint64_t two_gib = (uint64_t)2 << 30;
+    if (gate_tensor_bytes >= two_gib || down_tensor_bytes >= two_gib) {
+        if (!g_nommap_db_pro_fallback_logged) {
+            fprintf(stderr,
+                    "ds4: nommap DB reuse: whole-tensor >=2GiB, using legacy "
+                    "separate-buffer DB\n");
+            g_nommap_db_pro_fallback_logged = 1;
+        }
+        return 0;
+    }
+    if (!ds4_gpu_nommap_db_ensure_slabs(gate_tensor_bytes,
+                                        down_tensor_bytes,
+                                        gate_expert_bytes,
+                                        down_expert_bytes)) {
+        return 0;   /* could not build the DB slabs -> legacy path */
+    }
+    /* begin_reserve returns 0 (without mutating) if a DB-slab gen entry is still
+     * GPU-in-flight at this boundary -> fall back to the legacy DB this prompt. */
+    if (!ds4_gpu_nommap_db_begin_reserve()) return 0;
+    return 1;
+}
+
+/* Public (ds4.c): 1 while an in-place DB reservation is active this prompt (the
+ * begin_prefill above engaged it and end_prefill has not yet released it).  Lets
+ * the chunked-prefill error/cancel early-returns release the reservation only
+ * when it is actually held, so the default (reuse OFF) path is untouched. */
+int ds4_gpu_stream_nommap_db_reuse_engaged(void) {
+    return g_nommap_db_in_use;
+}
+
+/* Public (ds4.c) prefill-end hook: return the DB slabs to the gen cache without
+ * freeing them.  Idempotent and a no-op when reuse is OFF / never engaged. */
+void ds4_gpu_stream_nommap_db_end_prefill(void) {
+    if (!ds4_gpu_nommap_db_reuse_enabled()) return;
+    /* Drain any in-flight DB prefetch and zero the routed view metadata (so
+     * wrap_model_range stops matching the DB slabs during gen) WITHOUT purging
+     * the DB slab buffers -- the gen cache owns them now. */
+    for (uint32_t p = 0; p < 2; p++) {
+        if (g_stream_nommap_routed_pf[p].in_flight && g_stream_nommap_routed_pf[p].group) {
+            dispatch_group_wait(g_stream_nommap_routed_pf[p].group, DISPATCH_TIME_FOREVER);
+        }
+        g_stream_nommap_routed_pf[p].in_flight   = 0;
+        g_stream_nommap_routed_pf[p].loaded      = 0;
+        g_stream_nommap_routed_pf[p].layer_index = 0;
+        g_stream_nommap_routed_pf[p].err         = 0;
+    }
+    ds4_gpu_stream_nommap_routed_resset_teardown();
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; i++) {
+        /* Drop the routed-view reference to the DB slab (cache keeps its own
+         * strong ref in g_stream_expert_cache_slabs) and any legacy fall-back
+         * buffer.  A fall-back (mixed-precision) buffer is purged like _free does. */
+        int is_db_buf = 0;
+        if (g_nommap_db_slab_idx[i] >= 0) {
+            const uint32_t slab = (uint32_t)g_nommap_db_slab_idx[i];
+            if (slab < g_stream_expert_cache_slab_count &&
+                g_stream_nommap_routed[i].buffer == g_stream_expert_cache_slabs[slab]) {
+                is_db_buf = 1;
+            }
+        }
+        if (!is_db_buf && g_stream_nommap_routed[i].buffer) {
+            [g_stream_nommap_routed[i].buffer setPurgeableState:MTLPurgeableStateEmpty];
+        }
+        g_stream_nommap_routed[i].buffer       = nil;
+        g_stream_nommap_routed[i].model_offset = 0;
+        g_stream_nommap_routed[i].bytes        = 0;
+    }
+    ds4_gpu_nommap_db_end_reserve();
+}
+
+/* Public (ds4.c) end-of-prompt routed-DB release that routes by what THIS prompt
+ * actually used:
+ *  - DB reuse engaged this prompt (g_nommap_db_in_use set by begin_prefill) ->
+ *    db_end_prefill: return the DB slabs to gen WITHOUT freeing.
+ *  - otherwise (reuse OFF, q2-PRO >=2GiB fallback, alloc failure, or
+ *    batch_selected_addr path) -> legacy routed_release: free the separate
+ *    per-prompt double-buffer.
+ * This replaces the bare routed_release() call at the prefill->gen boundary. */
+void ds4_gpu_stream_nommap_routed_end_prefill(void) {
+    if (g_nommap_db_in_use) {
+        ds4_gpu_stream_nommap_db_end_prefill();
+    } else {
+        ds4_gpu_stream_nommap_routed_release();
+    }
+}
+
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     ds4_gpu_stream_expert_pending_load_clear();
     g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
@@ -11311,6 +11811,20 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     g_stream_expert_cache_slab_total_slots = 0;
     g_stream_expert_cache_free_slot_count = 0;
     g_stream_expert_cache_slab_slot_bytes = 0;
+    /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE: the slab teardown above purged the DB
+     * slabs along with the gen slabs (this is the engine-close / budget-change
+     * path, not the per-prompt nommap release).  Drop the DB bookkeeping so the
+     * next prefill rebuilds the DB slabs from scratch instead of pointing at
+     * freed slab indices.  Cheap and unconditional: when reuse is OFF these are
+     * already in their reset state. */
+    memset(g_stream_expert_cache_slab_db_role,
+           0,
+           sizeof(g_stream_expert_cache_slab_db_role));
+    for (uint32_t s = 0; s < DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS; s++) {
+        g_nommap_db_slab_idx[s] = -1;
+    }
+    g_nommap_db_slab_idx_init = 1;
+    g_nommap_db_in_use = 0;
     if (reset_stats) {
         g_stream_expert_cache_hits = 0;
         g_stream_expert_cache_misses = 0;
