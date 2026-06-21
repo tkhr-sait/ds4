@@ -20677,6 +20677,27 @@ static bool metal_graph_prefill_layer_major(
     const bool batch_selected_addr =
         metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens) ||
         metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, n_tokens);
+    /* In-place prefill DB reuse (ALWAYS ON for nommap streaming, no env toggle):
+     * on the nommap whole-tensor wrap path (!batch_selected_addr, multi-token),
+     * hold the prefill routed double-buffer IN dedicated gen cache slabs instead
+     * of separate per-prompt allocations.  Engage it once before the layer loop
+     * (idempotent across the per-chunk re-entry of this function); the
+     * end-of-prompt release (in the chunked_range caller) routes to db_end_prefill
+     * vs the legacy routed_release via the Metal-side db_in_use flag.  Sizes come
+     * from layer 0's actual shapes (never hardcoded).  No-op / returns 0 when the
+     * kill switch is set. */
+    if (g->ssd_streaming && g_stream_nommap_fd >= 0 && !batch_selected_addr &&
+        n_tokens > 1 && DS4_N_LAYER > 0) {
+        const ds4_layer_weights *l0 = &weights->layer[0];
+        if (l0->ffn_gate_exps && l0->ffn_up_exps && l0->ffn_down_exps) {
+            const uint64_t g_row = routed_expert_row_bytes(l0->ffn_gate_exps);
+            const uint64_t d_row = routed_expert_row_bytes(l0->ffn_down_exps);
+            const uint64_t g_eb  = (uint64_t)l0->ffn_gate_exps->dim[1] * g_row;
+            const uint64_t d_eb  = (uint64_t)l0->ffn_down_exps->dim[1] * d_row;
+            (void)ds4_gpu_stream_nommap_db_begin_prefill(g_eb, d_eb,
+                                                         (uint32_t)DS4_N_EXPERT);
+        }
+    }
 #ifdef DS4_ROCM_BUILD
     rocm_graph_stream_layer_expert_load rocm_full_layer_load;
     memset(&rocm_full_layer_load, 0, sizeof(rocm_full_layer_load));
@@ -21277,6 +21298,15 @@ static bool metal_graph_prefill_chunked_range(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
             }
+            /* DS4_METAL_ENABLE_NOMMAP_DB_REUSE: release the in-place DB reservation
+             * on this early exit too, else db_in_use stays set and gen runs with a
+             * shrunken slab set (the DB region withheld from the gen pool) until the
+             * next prompt.  Guarded by reuse_engaged() so the legacy (reuse-off /
+             * never-engaged) path is untouched. */
+            if (g->ssd_streaming && g_stream_nommap_fd >= 0 &&
+                ds4_gpu_stream_nommap_db_reuse_engaged()) {
+                ds4_gpu_stream_nommap_db_end_prefill();
+            }
             return false;
         }
         if (progress) {
@@ -21287,6 +21317,12 @@ static bool metal_graph_prefill_chunked_range(
         }
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
+            /* Release the in-place DB reservation on cancel too (see failure path
+             * above); only when engaged, so the reuse-OFF path is unchanged. */
+            if (g->ssd_streaming && g_stream_nommap_fd >= 0 &&
+                ds4_gpu_stream_nommap_db_reuse_engaged()) {
+                ds4_gpu_stream_nommap_db_end_prefill();
+            }
             return true;
         }
         pos0 = chunk_end;
@@ -21296,9 +21332,14 @@ static bool metal_graph_prefill_chunked_range(
      * tensors + residency set) before gen so that RAM is not left wired idle
      * through decode -- gen reads experts via the streaming cache, not these
      * buffers.  The next prefill re-allocates them lazily.  Footprint-only
-     * (nommap has no prefill/gen budget split to grow). */
+     * (nommap has no prefill/gen budget split to grow).
+     *
+     * DS4_METAL_ENABLE_NOMMAP_DB_REUSE: routed_end_prefill dispatches to
+     * db_end_prefill (return the in-place DB slabs to gen, no free) when the DB
+     * reuse path engaged this prompt, else to the legacy separate-buffer release
+     * (reuse OFF / q2-PRO >=2GiB fallback) -- byte-for-byte the old behavior. */
     if (g->ssd_streaming && g_stream_nommap_fd >= 0) {
-        ds4_gpu_stream_nommap_routed_release();
+        ds4_gpu_stream_nommap_routed_end_prefill();
     }
     if (profile) {
         const double t_read = now_sec();
