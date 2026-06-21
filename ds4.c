@@ -21208,6 +21208,235 @@ static bool metal_graph_prefill_raw_swa(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
+/* Would the layer-major-across-chunks prefill driver below apply to this range?
+ * It reorders the prefill loop layer-OUTER / chunk-INNER so each layer's
+ * whole-tensor experts are pread ONCE for the whole prompt instead of once per
+ * chunk, cutting the SSD read volume to ~1/n_chunks while preserving the F_NOCACHE
+ * clean-cache discipline.  DEFAULT ON for the clean no-mmap whole-tensor case
+ * (Mac-validated: q2 b65536 prefill 208->248 t/s beating the residency-lru
+ * full-page-cache path at 246, disk reads 210->72 GB, file-backed page cache held
+ * near-zero at ~2 GB vs residency-lru's 82 GB, swapout 0, output intact); set
+ * DS4_METAL_DISABLE_NOMMAP_LAYER_MAJOR to fall back to the per-chunk loop.  Any
+ * other streaming sub-mode (residency-lru,
+ * per-expert selected-addr, the explicit pagein/readahead prepare modes) or imatrix
+ * collection falls back automatically.  Multi-chunk + start==0 only (single-chunk /
+ * continuation prefills read each layer once already). */
+static bool metal_graph_prefill_nommap_layer_major_applies(
+        ds4_gpu_graph *g, const ds4_weights *weights,
+        uint32_t start, uint32_t n_tokens, ds4_imatrix_collector *imatrix) {
+    if (!g->ssd_streaming || g_stream_nommap_fd < 0) return false;
+    if (getenv("DS4_METAL_DISABLE_NOMMAP_LAYER_MAJOR") != NULL) return false;
+    if (imatrix != NULL) return false;
+    /* start==0 only: from a non-zero start the caller chunks at raw_cap with a
+     * prefill_cap-boundary alignment, so this driver's uniform prefill_cap chunk
+     * geometry would not match.  The big from-scratch prefill (the one that
+     * re-reads every expert per chunk) is always start==0. */
+    if (start != 0) return false;
+    if (g->prefill_cap == 0 || n_tokens <= g->prefill_cap) return false;   /* multi-chunk only */
+    /* whole-tensor wrap path only (the per-expert selected-addr path streams per
+     * expert and would re-read regardless of loop order). */
+    if (metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, g->prefill_cap) ||
+        metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, g->prefill_cap)) {
+        return false;
+    }
+    /* The explicit opt-in layer-prepare prefetch modes (pagein/readahead, gated by
+     * their own ENABLE env) have per-(layer,chunk) staging this driver does not
+     * replicate -- fall back to honour the user's choice.  The DEFAULT mode
+     * (layer_pread, on whenever streaming unless DISABLEd) is simply SUPERSEDED:
+     * this driver streams routed experts through the routed ensure/prefetch and
+     * relies on the startup-wired non-routed views, so it needs no prepare
+     * span-pread (and skipping it is what removes the per-chunk re-read). */
+    if (metal_graph_stream_prefill_layer_pagein_enabled(g) ||
+        metal_graph_stream_prefill_layer_readahead_enabled(g)) {
+        return false;
+    }
+    /* memory bound: the driver holds n_chunks+1 chunk-sized hidden buffers live.
+     * Cap it (env-tunable) and fall back for pathologically long prompts. */
+    uint32_t max_chunks = 32u;
+    const char *mc = getenv("DS4_METAL_NOMMAP_LAYER_MAJOR_MAX_CHUNKS");
+    if (mc && mc[0]) {
+        char *e = NULL; unsigned long v = strtoul(mc, &e, 10);
+        if (e != mc && *e == '\0' && v >= 2 && v <= 4096) max_chunks = (uint32_t)v;
+    }
+    const uint32_t n_chunks = (n_tokens + g->prefill_cap - 1u) / g->prefill_cap;
+    if (n_chunks > max_chunks) return false;
+    return true;
+}
+
+/* Layer-major-across-chunks prefill for the no-mmap whole-tensor path.  See the
+ * _applies() gate above.  Holds one persistent hidden (residual) buffer per chunk
+ * plus a shared scratch (n_chunks+1 total); processes layer-outer, chunk-inner so
+ * the routed ensure (a no-op when the slab already holds the layer) reads each
+ * layer's experts exactly once.  Causal KV order is preserved because chunks run
+ * in ascending order within every layer -- so each layer's KV/compressor sees the
+ * same position order as the chunk-major path (byte-identical final KV expected).
+ * The end-of-prompt DB release is left to the caller's shared tail. */
+static bool metal_graph_prefill_nommap_layer_major(
+        ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+        const token_vec *prompt, uint32_t start, uint32_t n_tokens,
+        float *logits, bool show_progress,
+        ds4_session_progress_fn display_progress, void *display_progress_ud,
+        ds4_session_cancel_fn cancel, void *cancel_ud, bool *cancelled) {
+    if (n_tokens == 0 || g->prefill_cap == 0 || DS4_N_LAYER == 0) return false;
+    const uint32_t cap      = g->prefill_cap;
+    const uint32_t end      = start + n_tokens;
+    const uint32_t n_chunks = (n_tokens + cap - 1u) / cap;
+    const uint64_t hc_dim   = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = (uint64_t)cap * hc_dim * sizeof(float);
+
+    /* one-time confirmation that the driver actually engaged (the gate is subtle). */
+    static int lm_logged = 0;
+    if (!lm_logged) {
+        fprintf(stderr, "ds4: nommap layer-major prefill ENGAGED (chunks=%u, cap=%u, tokens=%u)\n",
+                n_chunks, cap, n_tokens);
+        lm_logged = 1;
+    }
+
+    ds4_gpu_tensor **res = calloc(n_chunks, sizeof(*res));
+    if (!res) return false;
+    ds4_gpu_tensor *work_next = NULL;
+    ds4_gpu_tensor *saved_cur = g->batch_cur_hc;
+    ds4_gpu_tensor *saved_next = g->batch_next_hc;
+    bool ok = true;
+    bool cancelled_local = false;
+    for (uint32_t c = 0; c < n_chunks && ok; c++) {
+        res[c] = ds4_gpu_tensor_alloc(hc_bytes);
+        ok = res[c] != NULL;
+    }
+    if (ok) { work_next = ds4_gpu_tensor_alloc(hc_bytes); ok = work_next != NULL; }
+
+    /* chunk geometry helper */
+    #define DS4_LM_CHUNK_BEG(c) (start + (c) * cap)
+    #define DS4_LM_CHUNK_LEN(c) (((end - DS4_LM_CHUNK_BEG(c)) < cap) ? (end - DS4_LM_CHUNK_BEG(c)) : cap)
+
+    /* warm kernels for the full chunk size and (if the tail differs) its size */
+    if (ok) ok = metal_graph_warmup_prefill_kernels(g, model, weights, cap);
+    const uint32_t last_n = DS4_LM_CHUNK_LEN(n_chunks - 1u);
+    if (ok && last_n != cap) ok = metal_graph_warmup_prefill_kernels(g, model, weights, last_n);
+
+    /* engage the in-place DB slab reservation once (sizes from layer 0). */
+    if (ok && DS4_N_LAYER > 0) {
+        const ds4_layer_weights *l0 = &weights->layer[0];
+        if (l0->ffn_gate_exps && l0->ffn_up_exps && l0->ffn_down_exps) {
+            const uint64_t g_row = routed_expert_row_bytes(l0->ffn_gate_exps);
+            const uint64_t d_row = routed_expert_row_bytes(l0->ffn_down_exps);
+            const uint64_t g_eb  = (uint64_t)l0->ffn_gate_exps->dim[1] * g_row;
+            const uint64_t d_eb  = (uint64_t)l0->ffn_down_exps->dim[1] * d_row;
+            (void)ds4_gpu_stream_nommap_db_begin_prefill(g_eb, d_eb, (uint32_t)DS4_N_EXPERT);
+        }
+    }
+    if (ok) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(model, weights);
+    }
+
+    /* upload each chunk's prompt embeddings into its persistent residual buffer */
+    for (uint32_t c = 0; c < n_chunks && ok; c++) {
+        const uint32_t cs = DS4_LM_CHUNK_BEG(c);
+        const uint32_t cn = DS4_LM_CHUNK_LEN(c);
+        ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, cs, cn);
+        if (ok) ok = metal_graph_upload_prompt_embeddings_hc(res[c], g->prefill_tokens,
+                                                             model, weights, prompt, cs, cn);
+    }
+
+    metal_graph_stream_prefill_selected_profile_reset(g);
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (cancel && cancel(cancel_ud)) {
+            cancelled_local = true;
+            break;
+        }
+        g->streaming_static_decode_map_current = false;
+        if (!metal_graph_stream_map_layer(model, weights, il)) { ok = false; break; }
+        /* prefetch layer il+1's whole gate/up/down expert tensors so its F_NOCACHE
+         * read overlaps ALL of layer il's chunks (an n_chunks-times wider compute
+         * window than the chunk-major path, so the read hides easily). */
+        if (il + 1u < DS4_N_LAYER) {
+            const ds4_layer_weights *nl = &weights->layer[il + 1u];
+            if (nl->ffn_gate_exps && nl->ffn_up_exps && nl->ffn_down_exps) {
+                const uint64_t ng_row = routed_expert_row_bytes(nl->ffn_gate_exps);
+                const uint64_t nd_row = routed_expert_row_bytes(nl->ffn_down_exps);
+                const uint64_t ng_eb  = (uint64_t)nl->ffn_gate_exps->dim[1] * ng_row;
+                const uint64_t nd_eb  = (uint64_t)nl->ffn_down_exps->dim[1] * nd_row;
+                const uint64_t pf_off[3] = { nl->ffn_gate_exps->abs_offset,
+                                             nl->ffn_up_exps->abs_offset,
+                                             nl->ffn_down_exps->abs_offset };
+                const uint64_t pf_len[3] = { (uint64_t)DS4_N_EXPERT * ng_eb,
+                                             (uint64_t)DS4_N_EXPERT * ng_eb,
+                                             (uint64_t)DS4_N_EXPERT * nd_eb };
+                (void)ds4_gpu_stream_nommap_routed_prefetch(model->size, pf_off, pf_len, il + 1u);
+            }
+        }
+        for (uint32_t c = 0; ok && c < n_chunks; c++) {
+            const uint32_t cs = DS4_LM_CHUNK_BEG(c);
+            const uint32_t cn = DS4_LM_CHUNK_LEN(c);
+            g->batch_cur_hc  = res[c];
+            g->batch_next_hc = work_next;
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, cs, cn);
+            if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g, il, cn);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            if (ok) ok = metal_graph_stream_prefill_selected_profile_layer(g, &weights->layer[il], il, cn);
+            if (!ok) break;
+            /* encode_layer_batch swapped the globals: batch_cur_hc now holds this
+             * chunk's layer output, batch_next_hc the (now free) old residual.
+             * Persist the rotation so res[c] stays this chunk's residual. */
+            res[c]    = g->batch_cur_hc;
+            work_next = g->batch_next_hc;
+        }
+        if (show_progress) {
+            fprintf(stderr, "ds4: gpu nommap layer-major prefill layer %u/%u\r",
+                    il + 1u, (uint32_t)DS4_N_LAYER);
+            fflush(stderr);
+        }
+        gpu_graph_report_prefill_display_progress(display_progress, display_progress_ud,
+                                                  start, n_tokens, il + 1u, prompt->len);
+    }
+    if (show_progress) fputc('\n', stderr);
+    if (ok && !cancelled_local) metal_graph_stream_prefill_selected_profile_summary(g);
+
+    /* seed the gen streaming expert cache from this prefill's hotness (once).
+     * Skip on cancel: the sweep is incomplete and its logits would be partial. */
+    if (ok && !cancelled_local) ok = metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights);
+    if (ok && !cancelled_local) ok = metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights);
+
+    /* output head on the final chunk's last token */
+    if (ok && !cancelled_local && logits) {
+        const uint32_t last_c  = n_chunks - 1u;
+        const uint32_t last_cn = DS4_LM_CHUNK_LEN(last_c);
+        uint32_t output_row = last_cn - 1u;
+        const char *output_row_env = getenv("DS4_METAL_GRAPH_OUTPUT_ROW");
+        if (output_row_env && output_row_env[0]) {
+            char *e = NULL; unsigned long v = strtoul(output_row_env, &e, 10);
+            if (e != output_row_env && v < (unsigned long)last_cn) output_row = (uint32_t)v;
+        }
+        ds4_gpu_tensor *saved_cur_hc = g->cur_hc;
+        ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(res[last_c], output_row, hc_dim);
+        ok = last_hc != NULL;
+        if (ok) ok = metal_graph_stream_map_output(model, weights);
+        if (ok) { g->cur_hc = last_hc; ok = ds4_gpu_begin_commands() != 0; }
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        g->cur_hc = saved_cur_hc;
+        if (last_hc) ds4_gpu_tensor_free(last_hc);
+        if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, logits,
+                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+
+    g->batch_cur_hc  = saved_cur;
+    g->batch_next_hc = saved_next;
+    for (uint32_t c = 0; c < n_chunks; c++) if (res[c]) ds4_gpu_tensor_free(res[c]);
+    if (work_next) ds4_gpu_tensor_free(work_next);
+    free(res);
+    if (!ok && ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: Metal synchronize after nommap layer-major prefill failure also failed\n");
+    }
+    if (ok && cancelled_local && cancelled) *cancelled = true;
+    #undef DS4_LM_CHUNK_BEG
+    #undef DS4_LM_CHUNK_LEN
+    return ok;
+}
+
 static bool metal_graph_prefill_chunked_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -21266,7 +21495,36 @@ static bool metal_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
-    for (uint32_t pos0 = start; pos0 < end; ) {
+    /* No-mmap whole-tensor path (default; DS4_METAL_DISABLE_NOMMAP_LAYER_MAJOR to
+     * opt out): run the layer-major-across-chunks driver instead of the per-chunk
+     * loop so each layer's experts are pread once for the whole prompt.  On success
+     * skip the per-chunk loop (pos0_init = end) -- the shared tail below (DB release,
+     * profiling) still runs for both paths.  The gate keeps the existing loop
+     * byte-identical when the conditions do not apply (pos0_init == start). */
+    uint32_t pos0_init = start;
+    if (metal_graph_prefill_nommap_layer_major_applies(g, weights, start, n_tokens, imatrix)) {
+        bool lm_cancelled = false;
+        const bool lm_ok = metal_graph_prefill_nommap_layer_major(
+            g, model, weights, prompt, start, n_tokens, logits, show_progress,
+            display_progress, display_progress_ud, cancel, cancel_ud, &lm_cancelled);
+        if (!lm_ok) {
+            if (g->ssd_streaming && g_stream_nommap_fd >= 0 &&
+                ds4_gpu_stream_nommap_db_reuse_engaged()) {
+                ds4_gpu_stream_nommap_db_end_prefill();
+            }
+            return false;
+        }
+        if (lm_cancelled && cancelled) *cancelled = true;
+        if (progress) {
+            progress(progress_ud, "prefill_chunk", (int)end, prompt->len);
+        }
+        if (display_progress) {
+            display_progress(display_progress_ud, "prefill_display", (int)end, prompt->len);
+        }
+        pos0_init = end;   /* loop body below is skipped; shared tail still runs */
+    }
+
+    for (uint32_t pos0 = pos0_init; pos0 < end; ) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
             return true;
