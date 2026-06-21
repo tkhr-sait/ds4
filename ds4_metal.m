@@ -8823,7 +8823,18 @@ void ds4_gpu_stream_nommap_persist_clear(void) {
 _Static_assert(DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS == 6,
                "g_nommap_db_slab_idx[] must match DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS");
 static ds4_gpu_stream_nommap_view g_stream_nommap_routed[DS4_METAL_STREAM_NOMMAP_ROUTED_SLOTS];
-static id             g_stream_nommap_routed_resset;   /* id<MTLResidencySet>, macOS 15+; current layer's set */
+static id             g_stream_nommap_routed_resset;   /* id<MTLResidencySet>, macOS 15+; current layer's set (aliases _pc[parity]) */
+/* Per-parity cached residency set + the 3 buffers each was built over.  Under the
+ * in-place DB slab reuse the parity slots hold the SAME slab buffers for the whole
+ * prefill (only their byte-0 contents are repread per layer), so the set built for
+ * a parity stays valid across every layer of that parity -- rebuilding it per
+ * ensure (teardown+create+commit+requestResidency) was pure overhead (observed:
+ * 129 rebuilds / ~1.9 s).  Reuse it whenever the slot buffers are unchanged; the
+ * legacy separate-buffer path (db_in_use==0) reallocates per layer so it still
+ * rebuilds (buffers differ).  Compare-only refs (no retain; the strong refs live
+ * in g_stream_nommap_routed[].buffer / the gen cache). */
+static id             g_stream_nommap_routed_resset_pc[2];
+static __unsafe_unretained id g_stream_nommap_routed_resset_bufs[2][3];
 
 /* One per layer parity (il & 1).  group/err track that parity's background read;
  * loaded/in_flight/layer_index say which layer the 3 slots currently hold. */
@@ -8836,16 +8847,37 @@ typedef struct {
 } ds4_gpu_stream_nommap_routed_parity;
 static ds4_gpu_stream_nommap_routed_parity g_stream_nommap_routed_pf[2];
 
-static void ds4_gpu_stream_nommap_routed_resset_teardown(void) {
+/* prefetch-wait instrumentation (DS4_METAL_NOMMAP_ROUTED_PROFILE).  Accumulates,
+ * over one prefill, the time the routed GEMM blocks in ensure() on a not-yet-done
+ * background pread (the symptom Step 1/2 attack), plus the residency-set rebuild
+ * time and the layer-ensure count.  Logged + reset at the prefill->gen boundary
+ * (ds4_gpu_stream_nommap_routed_end_prefill). */
+static double   g_stream_nommap_routed_wait_ms;
+static double   g_stream_nommap_routed_resset_ms;
+static uint32_t g_stream_nommap_routed_ensures;
+static uint32_t g_stream_nommap_routed_resset_builds;
+
+static void ds4_gpu_stream_nommap_routed_resset_teardown_parity(uint32_t p) {
 #if TARGET_OS_OSX
-    if (g_stream_nommap_routed_resset) {
+    if (p < 2 && g_stream_nommap_routed_resset_pc[p]) {
         if (@available(macOS 15.0, *)) {
-            [g_stream_nommap_routed_resset endResidency];
-            [g_stream_nommap_routed_resset removeAllAllocations];
+            [g_stream_nommap_routed_resset_pc[p] endResidency];
+            [g_stream_nommap_routed_resset_pc[p] removeAllAllocations];
         }
-        g_stream_nommap_routed_resset = nil;
+        g_stream_nommap_routed_resset_pc[p] = nil;
     }
+    if (p < 2) {
+        for (uint32_t i = 0; i < 3u; i++) g_stream_nommap_routed_resset_bufs[p][i] = nil;
+    }
+#else
+    (void)p;
 #endif
+}
+
+static void ds4_gpu_stream_nommap_routed_resset_teardown(void) {
+    ds4_gpu_stream_nommap_routed_resset_teardown_parity(0);
+    ds4_gpu_stream_nommap_routed_resset_teardown_parity(1);
+    g_stream_nommap_routed_resset = nil;   /* aliased one of the per-parity sets */
 }
 
 static void ds4_gpu_stream_nommap_routed_free(void) {
@@ -8901,27 +8933,81 @@ void ds4_gpu_stream_nommap_routed_release(void) {
     ds4_gpu_stream_nommap_routed_free();
 }
 
-/* Submit a page-aligned pread into a routed slot on this parity's own dispatch
- * group, so the two parities can be waited on independently. */
+/* Number of parallel page-aligned sub-range preads a single whole-tensor read is
+ * split into.  The no-mmap routed prefetch otherwise issues only one task per
+ * (gate, up, down) tensor = just 3 reads in flight, which leaves the NVMe queue
+ * shallow and the F_NOCACHE SSD bandwidth under-utilised vs the residency-lru
+ * per-expert pool (~9 workers).  Splitting each whole-tensor read into K
+ * page-aligned sub-ranges raises the in-flight depth to 3*K WITHOUT touching the
+ * page cache (still explicit pread on the F_NOCACHE fd into the owned buffer).
+ * Env override mirrors DS4_METAL_STREAMING_EXPERT_PREAD_THREADS. */
+static uint32_t ds4_gpu_stream_nommap_routed_pread_split(void) {
+    uint32_t split = 1;   /* default = original single read; opt-in via env. The
+                           * layer-major-across-chunks driver (DS4_METAL_NOMMAP_LAYER_MAJOR)
+                           * is the primary read-volume fix; this split only deepens
+                           * the queue for a single read and stays off by default. */
+    const char *env = getenv("DS4_METAL_NOMMAP_ROUTED_PREAD_SPLIT");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            split = v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+        }
+    }
+    if (split == 0) split = 1;
+    if (split > 12) split = 12;
+    return split;
+}
+
+/* Submit a page-aligned pread of [page_off, page_off+want) into dst on this
+ * parity's own dispatch group, so the two parities can be waited on
+ * independently.  The read is split into up to K page-aligned sub-ranges (each
+ * its own task on the concurrent fill queue) so several reads of the same whole
+ * tensor are in flight at once, keeping the SSD queue deep.  All sub-ranges write
+ * DISJOINT offsets of the same owned buffer (safe); any task's failure is OR'd
+ * into p->err and the caller waits on the whole group. */
 static void ds4_gpu_stream_nommap_routed_fill_submit(ds4_gpu_stream_nommap_routed_parity *p,
                                                      uint8_t *dst, uint64_t page_off, uint64_t want) {
     const int fd = g_stream_nommap_fd;
-    dispatch_group_async(p->group, g_stream_nommap_fill_queue, ^{
-        uint64_t done = 0;
-        while (done < want) {
-            size_t n = (size_t)(want - done);
-            if (n > DS4_PREAD_CHUNK) n = DS4_PREAD_CHUNK;
-            ssize_t r = pread(fd, dst + done, n, (off_t)(page_off + done));
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
-                return;
+    const uint64_t page = (uint64_t)getpagesize();
+    /* Keep at least 64 MiB of payload per sub-range so small tensors are not
+     * over-split into sub-bandwidth reads. */
+    const uint64_t MIN_SEG = (uint64_t)64 << 20;
+    uint32_t split = ds4_gpu_stream_nommap_routed_pread_split();
+    uint64_t max_by_size = want / MIN_SEG;
+    if (max_by_size == 0) max_by_size = 1;
+    if ((uint64_t)split > max_by_size) split = (uint32_t)max_by_size;
+    if (split < 1) split = 1;
+    /* Page-aligned segment size; page_off is already page-aligned so every
+     * page_off+seg_off stays aligned (F_NOCACHE requires an aligned offset).  The
+     * final segment may be shorter / unaligned in length only at EOF, exactly as
+     * the single-read path was. */
+    uint64_t seg = (want + split - 1) / split;
+    if (page != 0) seg = round_up_u64(seg, page);
+    if (seg == 0) seg = (page != 0) ? page : want;
+    for (uint64_t seg_off = 0; seg_off < want; seg_off += seg) {
+        uint64_t        seg_want = want - seg_off;
+        if (seg_want > seg) seg_want = seg;
+        uint8_t * const seg_dst  = dst + seg_off;
+        const uint64_t  seg_pos  = page_off + seg_off;
+        const uint64_t  seg_len  = seg_want;
+        dispatch_group_async(p->group, g_stream_nommap_fill_queue, ^{
+            uint64_t done = 0;
+            while (done < seg_len) {
+                size_t n = (size_t)(seg_len - done);
+                if (n > DS4_PREAD_CHUNK) n = DS4_PREAD_CHUNK;
+                ssize_t r = pread(fd, seg_dst + done, n, (off_t)(seg_pos + done));
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
+                    return;
+                }
+                if (r == 0) break;
+                done += (uint64_t)r;
             }
-            if (r == 0) break;
-            done += (uint64_t)r;
-        }
-        if (done < want) __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
-    });
+            if (done < seg_len) __atomic_store_n(&p->err, 1, __ATOMIC_RELAXED);
+        });
+    }
 }
 
 /* Kick off the background pread of layer_index's whole gate/up/down expert
@@ -9032,15 +9118,52 @@ static int ds4_gpu_stream_nommap_routed_ensure(uint64_t model_size,
     if (!((p->in_flight || p->loaded) && p->layer_index == layer_index)) {
         if (!ds4_gpu_stream_nommap_routed_issue(model_size, offs, lens, layer_index)) return 0;
     }
+    g_stream_nommap_routed_ensures++;
     if (p->in_flight) {
-        if (p->group) dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+        if (p->group) {
+            const double w0 = ds4_gpu_now_ms();
+            dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
+            g_stream_nommap_routed_wait_ms += ds4_gpu_now_ms() - w0;
+        }
         p->in_flight = 0;
         if (__atomic_load_n(&p->err, __ATOMIC_RELAXED) != 0) return 0;
         p->loaded = 1;
     }
-    ds4_gpu_stream_nommap_routed_resset_teardown();
-    g_stream_nommap_routed_resset = ds4_gpu_stream_nommap_residency_build(
-        &g_stream_nommap_routed[base], 3u, @"ds4_gpu_stream_nommap_routed");
+    if (g_nommap_db_in_use) {
+        /* In-place DB slabs are stable for the whole prefill: reuse this parity's
+         * cached residency set unless its slot buffers actually changed.  This is
+         * what collapses the per-layer rebuild churn (was 129 rebuilds / ~1.9 s ->
+         * 2, one per parity). */
+        int reuse = (g_stream_nommap_routed_resset_pc[parity] != nil);
+        for (uint32_t i = 0; reuse && i < 3u; i++) {
+            if (g_stream_nommap_routed_resset_bufs[parity][i] != g_stream_nommap_routed[base + i].buffer) {
+                reuse = 0;
+            }
+        }
+        if (!reuse) {
+            ds4_gpu_stream_nommap_routed_resset_teardown_parity(parity);
+            const double r0 = ds4_gpu_now_ms();
+            g_stream_nommap_routed_resset_pc[parity] = ds4_gpu_stream_nommap_residency_build(
+                &g_stream_nommap_routed[base], 3u, @"ds4_gpu_stream_nommap_routed");
+            g_stream_nommap_routed_resset_ms += ds4_gpu_now_ms() - r0;
+            g_stream_nommap_routed_resset_builds++;
+            for (uint32_t i = 0; i < 3u; i++) {
+                g_stream_nommap_routed_resset_bufs[parity][i] = g_stream_nommap_routed[base + i].buffer;
+            }
+        }
+        g_stream_nommap_routed_resset = g_stream_nommap_routed_resset_pc[parity];
+    } else {
+        /* Legacy separate-buffer path: slots are reallocated per layer, so the set
+         * must be rebuilt every ensure.  Tear down BOTH parities (as the single-set
+         * original did) so no stale set retains a freed owned buffer. */
+        ds4_gpu_stream_nommap_routed_resset_teardown();
+        const double r0 = ds4_gpu_now_ms();
+        g_stream_nommap_routed_resset_pc[parity] = ds4_gpu_stream_nommap_residency_build(
+            &g_stream_nommap_routed[base], 3u, @"ds4_gpu_stream_nommap_routed");
+        g_stream_nommap_routed_resset_ms += ds4_gpu_now_ms() - r0;
+        g_stream_nommap_routed_resset_builds++;
+        g_stream_nommap_routed_resset = g_stream_nommap_routed_resset_pc[parity];
+    }
     return 1;
 }
 
@@ -11746,7 +11869,29 @@ void ds4_gpu_stream_nommap_db_end_prefill(void) {
  *    batch_selected_addr path) -> legacy routed_release: free the separate
  *    per-prompt double-buffer.
  * This replaces the bare routed_release() call at the prefill->gen boundary. */
+/* DS4_METAL_NOMMAP_ROUTED_PROFILE: log this prefill's routed prefetch-wait
+ * summary (how long the GEMM stalled on background preads, plus residency-set
+ * rebuild cost), then reset the accumulators.  No-op output when the env is
+ * unset; always resets so the next prefill starts clean. */
+static void ds4_gpu_stream_nommap_routed_profile_flush(void) {
+    if (g_stream_nommap_routed_ensures != 0 &&
+        getenv("DS4_METAL_NOMMAP_ROUTED_PROFILE") != NULL) {
+        fprintf(stderr,
+                "ds4: nommap routed prefill: %u layer-ensures, prefetch-wait "
+                "%.3f ms, residency-set %.3f ms (%u rebuilds)\n",
+                g_stream_nommap_routed_ensures,
+                g_stream_nommap_routed_wait_ms,
+                g_stream_nommap_routed_resset_ms,
+                g_stream_nommap_routed_resset_builds);
+    }
+    g_stream_nommap_routed_wait_ms       = 0.0;
+    g_stream_nommap_routed_resset_ms     = 0.0;
+    g_stream_nommap_routed_ensures       = 0;
+    g_stream_nommap_routed_resset_builds = 0;
+}
+
 void ds4_gpu_stream_nommap_routed_end_prefill(void) {
+    ds4_gpu_stream_nommap_routed_profile_flush();
     if (g_nommap_db_in_use) {
         ds4_gpu_stream_nommap_db_end_prefill();
     } else {
