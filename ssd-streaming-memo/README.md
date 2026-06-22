@@ -31,6 +31,12 @@ Source logs: `/workspace/logs/ssd-streaming-brushup/` (plots in `plots/*.svg`)
 - [8. System metrics (mactop)](#8-system-metrics-mactop)
   - [8a. q4 b80 all-strategy charts](#8a-q4-b80-all-strategy-charts)
   - [8b. Items with large strategy differences](#8b-items-with-large-strategy-differences-all-q4-b80)
+- [9. nommap re-measurement (post-fix, commit `116b936`)](#9-nommap-re-measurement-post-fix-commit-116b936)
+  - [9a. Highlights](#9a-highlights)
+  - [9b. Prefill throughput (old→new, Δ vs baseline)](#9b-prefill-throughput-oldnew-δ-vs-baseline)
+  - [9c. Generation throughput (new, with gen tok)](#9c-generation-throughput-new-with-gen-tok)
+  - [9d. Memory (PhysMem peak / vm_stat)](#9d-memory-physmem-peak--vm_stat)
+  - [9e. System metrics (mactop, representative runs old→new)](#9e-system-metrics-mactop-representative-runs-oldnew)
 
 ---
 
@@ -531,3 +537,139 @@ The absolute DRAM BW is not proportional to gen t/s. **nommap has the highest BW
 - **baseline (low BW, mid t/s)**: BW is low because thrash page faults / SSD I/O waits mean **the time actually touching memory is short** (**GPU active the lowest at 59%**). Yet the moment a cache hit lands the GPU can read mmap pages directly, and freq is high at 1355, so during non-stalled intervals it maintains gen 11.00.
 - **CPU usage is low for all strategies (3–6%)**: mostly pread issuance and GEMM dispatch; the heavy work is on the GPU side. nommap's lowest CPU at 3.0% reflects I/O waiting. p-cluster freq is flat at ~3.5 GHz (CPU is not the bottleneck).
 - → What determines gen t/s is **whether the GPU can run MoE continuously without waiting on weights (GPU utilization / GPU freq)**, not the absolute DRAM BW. Even high BW does not contribute to speed if its substance is I/O copying.
+
+---
+
+## 9. nommap re-measurement (post-fix, commit `116b936`)
+
+Re-measured: 2026-06-21 / hardware, model, and workload identical to §3 / source logs: `/workspace/logs/no-mmap-brushup/`
+
+Results of re-measuring **nommap only** after applying the **3 nommap fixes** that landed after this report's first edition (commit `ee5f2f9`, nommap = `cae5e95`). The numbers in §1–§8 are left as the first edition (`cae5e95` era); this section **appends** the post-fix values (baseline / residency-lru / full were not re-measured, so §6/§8 values are used as the comparison baseline).
+
+- `f4a1114` … no-mmap × `--quality` decode fix + teardown buffer release (a correctness fix surfaced by ds4_test; does **not** contribute to this report's speed/memory numbers)
+- `7af0623` … no-mmap prefill **Double Buffer in-place reuse** (preads the prefill DB over gen slabs instead of a separate buffer; a wired-*discipline* fix = §9a② / §9d. startup log abbreviates it `DB`)
+- `116b936` … no-mmap prefill **layer-major over chunks** (reorders processing to read each expert only once during prefill = the speed driver = §9a①)
+
+The measurement conditions and representative-value definitions (prefill = final avg at the 100.0% point of the largest prefill, 10,652 tok; gen = final avg of the longest gen sequence; PhysMem peak; vm_stat aggregation; mactop aggregation) are identical to §3/§6/§7/§8. The startup log confirms `DS4_METAL_ENABLE_STREAMING_NO_MMAP enabled` and `nommap DB in-place reuse: ON` (meaning Double Buffer in-place reuse; only the log abbreviates it `DB`). budget 80 is capped to 75 GiB by ds4 (the same ~70% ceiling as §3).
+
+### 9a. Highlights
+
+- **Two prefill changes.**
+  - **① layer-major over chunks (reorders processing) = the speed driver.** Reorders the reads so each layer's experts are read only once during prefill, cutting redundant SSD reads (the old chunk-major re-read per chunk; consistent with the lower disk read in §9e). **q4 roughly doubles** (b32 117.5→**218.4** / b80 126.7→**231.5**) and now **beats both residency-lru (b80 129.2) and baseline (113.2) — fastest q4 prefill** (b80 **+118** vs baseline / **+102** vs r-lru). **q2 also overtakes baseline at high budget** (b80 215.2→**249.9**, +35.7), and the low-budget gap shrinks (b8 −42.4 → **−8.6**).
+  - **② Double Buffer in-place reuse = a wired-*discipline* fix** (no speed contribution). Preads the prefill double-buffer over existing gen slabs instead of allocating a separate MTLBuffer, removing per-prompt orphan/churn. **It does not lower the single-run peak wired**, but keeps total bounded to budget+fixed over long / repeated sessions (see §9d).
+- **gen is essentially unchanged** (longest-sequence avg: q4 b80 9.01→**8.65**, q2 b80 19.92→**19.06**; within run-to-run variance since gen tok varies per run). ② is a memory-discipline change with no gen-speed contribution (the old nommap also ran gen at full budget, so gen behavior is unchanged). q2 b80 gen is about level with baseline (19.37) but slightly below (−0.31); the "overtakes baseline" seen in the old version was within run variance.
+- **Memory savings preserved.** file-backed **≈1.2–2.8 GiB** / compressor **0** / swapout **0** at every budget, and used / wired / unused are at the same level as §6c (§9d). It **combines** faster prefill with the smallest RAM footprint.
+
+### 9b. Prefill throughput (old→new, Δ vs baseline)
+
+baseline / residency-lru are the unchanged §6a (`cae5e95`-era) values. **nommap new** is the post-fix measurement.
+
+**q2**
+
+| budget(GiB) | baseline | nommap old | **nommap new (Δ vs baseline)** |
+|---|---|---|---|
+| 8 | 248.9 | 206.5 | **240.3 (−8.6)** |
+| 16 | 248.7 | 210.1 | **242.0 (−6.7)** |
+| 32 | 249.3 | 214.6 | **239.6 (−9.7)** |
+| 64 | 212.5 | 215.9 | **251.1 (+38.6)** |
+| 80 | 214.2 | 215.2 | **249.9 (+35.7)** |
+
+**q4** (residency-lru also shown = the key comparison for this fix)
+
+| budget(GiB) | baseline | residency-lru | nommap old | **nommap new (Δ vs baseline / vs r-lru)** |
+|---|---|---|---|---|
+| 8 | 131.2 | 131.6 | 117.1 | **205.1 (+73.9 / +73.5)** |
+| 16 | 128.8 | 131.9 | 113.9 | **207.0 (+78.2 / +75.1)** |
+| 32 | 120.6 | 136.0 | 117.5 | **218.4 (+97.8 / +82.4)** |
+| 64 | 117.6 | 133.0 | 123.5 | **227.3 (+109.7 / +94.3)** |
+| 80 | 113.2 | 129.2 | 126.7 | **231.5 (+118.3 / +102.3)** |
+
+### 9c. Generation throughput (new, with gen tok)
+
+t/s = final avg of the longest gen sequence; parentheses = Δ t/s vs baseline (§6b) and the final gen tok.
+
+**q2**
+
+| budget(GiB) | baseline | nommap old | **nommap new (Δ vs baseline, tok)** |
+|---|---|---|---|
+| 8 | 14.95 | 4.52 | **4.77 (−10.18, 1732)** |
+| 16 | 17.12 | 6.54 | **6.57 (−10.55, 2096)** |
+| 32 | 19.29 | 12.16 | **11.70 (−7.59, 1955)** |
+| 64 | 20.27 | 19.57 | **19.54 (−0.73, 1766)** |
+| 80 | 19.37 | 19.92 | **19.06 (−0.31, 1864)** |
+
+**q4**
+
+| budget(GiB) | baseline | nommap old* | **nommap new (Δ vs baseline, tok)** |
+|---|---|---|---|
+| 8 | 8.86 | 2.12 | **2.07 (−6.79, 3137)** |
+| 16 | 9.31 | 2.68* | **2.63 (−6.68, 1955)** |
+| 32 | 8.98 | 3.60 | **3.58 (−5.40, 2569)** |
+| 64 | 9.00 | 7.03* | **7.01 (−1.99, 1795)** |
+| 80 | 11.00 | 9.01* | **8.65 (−2.35, 3151)** |
+
+> \* The old nommap q4 values at b16/b64/b80 published in §6b picked the **first session's avg** (2.73 / 7.23 / 7.59). Here they are shown re-stated to the **longest gen sequence avg** per the §3 definition (2.68 / 7.03 / 9.01). The new values are also longest-sequence avgs. gen is effectively flat old→new (within run variance).
+
+### 9d. Memory (PhysMem peak / vm_stat)
+
+**PhysMem peak (new nommap)** — same format as §6c.
+
+| quant | budget(GiB) | used(GiB) | wired(GiB) | compressor(GiB) | min unused(GiB) | swapout |
+|---|---|---|---|---|---|---|
+| q2 | 8 | 38 | 23 | 0.0 | 89.0 | 0 |
+| q2 | 16 | 46 | 32 | 0.0 | 81.0 | 0 |
+| q2 | 32 | 62 | 45 | 0.0 | 65.0 | 0 |
+| q2 | 64 | 90 | 77 | 0.0 | 37.0 | 0 |
+| q2 | 80 | 101 | 88 | 0.0 | 26.0 | 0 |
+| q4 | 8 | 41 | 24 | 0.0 | 86.0 | 0 |
+| q4 | 16 | 49 | 31 | 0.0 | 78.0 | 0 |
+| q4 | 32 | 66 | 47 | 0.0 | 62.0 | 0 |
+| q4 | 64 | 97 | 79 | 0.0 | 30.0 | 0 |
+| q4 | 80 | 108 | 90 | 0.0 | 19.0 | 0 |
+
+**vm_stat instantaneous peak (new nommap, GiB)** — same format as §7a/§7c.
+
+| quant | budget | wired | **file-backed** | anonymous | compressed | inactive | min free |
+|---|---|---|---|---|---|---|---|
+| q2 | 8 | 22.9 | 2.8 | 25.9 | 0.0 | 12.0 | 87.8 |
+| q2 | 16 | 28.6 | 2.7 | 26.3 | 0.0 | 10.9 | 79.5 |
+| q2 | 32 | 49.7 | 1.9 | 25.9 | 0.0 | 10.9 | 63.7 |
+| q2 | 64 | 77.1 | 1.2 | 23.0 | 0.0 | 9.6 | 35.9 |
+| q2 | 80 | 88.0 | 2.0 | 28.6 | 0.0 | 11.4 | 24.4 |
+| q4 | 8 | 22.6 | 2.3 | 28.7 | 0.0 | 11.8 | 85.3 |
+| q4 | 16 | 30.4 | 2.7 | 29.0 | 0.0 | 11.6 | 76.7 |
+| q4 | 32 | 46.7 | 2.2 | 29.0 | 0.0 | 12.5 | 60.7 |
+| q4 | 64 | 78.6 | 1.8 | 29.7 | 0.0 | 12.3 | 29.5 |
+| q4 | 80 | 89.7 | 1.7 | 29.4 | 0.0 | 11.6 | 18.3 |
+
+**vm_stat cumulative/events (new nommap, whole run)** — same format as §7b/§7d.
+
+| quant | budget | faults | pageins(GiB) | pageout | comprs | dcomprs | swapout(pages) |
+|---|---|---|---|---|---|---|---|
+| q2 | 8 | 2523k | 1.6 | 0 | 0k | 0k | 0 |
+| q2 | 16 | 2855k | 1.4 | 0 | 0k | 0k | 0 |
+| q2 | 32 | 3656k | 1.1 | 0 | 0k | 0k | 0 |
+| q2 | 64 | 5619k | 0.6 | 0 | 0k | 0k | 0 |
+| q2 | 80 | 5911k | 1.0 | 0 | 0k | 0k | 0 |
+| q4 | 8 | 3945k | 1.4 | 0 | 0k | 0k | 0 |
+| q4 | 16 | 3739k | 1.5 | 0 | 0k | 0k | 0 |
+| q4 | 32 | 4579k | 1.3 | 0 | 0k | 0k | 0 |
+| q4 | 64 | 6055k | 0.9 | 0 | 0k | 0k | 0 |
+| q4 | 80 | 6849k | 1.0 | 0 | 0k | 0k | 0 |
+
+file-backed ≈1.2–2.8 GiB and compressed/comprs/dcomprs/swapout = 0 match the nommap observations in §7e verbatim. Even with prefill roughly doubled, the "never touch the OS page cache" design holds.
+
+**wired is at essentially the same level as the old nommap — not a reduction** (vs §6c, q4 b80 88→90, q2 b80 85→88). This ~2 GiB is **environmental noise**: the ds4 process RSS is **old 90.3 = new 90.3 GiB** at q4 b80 (mactop `rss_kb`, 0.6 MB apart) — identical — so the system-wide wired drift is an other-apps/OS baseline difference (idle `used` before ds4 loads: old 8.8 → new 11.0 GiB), not a change in ds4's footprint. total pins to budget + a fixed ~11 GiB by design (§9a②); Double Buffer in-place reuse is not a peak reduction but an orphan/churn-avoidance discipline fix.
+
+### 9e. System metrics (mactop, representative runs old→new)
+
+| run | total power W (avg/max) | GPU power W (avg) | DRAM BW GB/s (avg) | disk read MB/s (avg/max) | GPU temp ℃ (max) | GPU active % (avg) |
+|---|---|---|---|---|---|---|
+| q2 nommap b32 old | 54.4 / 123.1 | 14.8 | 120.0 | 2299 / 5013 | 100.8 | 80.6 |
+| **q2 nommap b32 new** | 52.8 / 128.2 | 13.5 | **129.6** | **1673** / 2887 | 101.3 | **84.6** |
+| q4 nommap b80 old | 36.3 / 81.6 | 7.9 | 110.0 | 2597 / 6080 | 99.4 | 64.4 |
+| **q4 nommap b80 new** | 34.8 / 131.5 | 6.7 | **115.9** | **2071** / 6076 | 101.1 | **71.7** |
+
+- **disk read avg drops** (q2 b32 2299→**1673**, q4 b80 2597→**2071**) — direct evidence that layer-major now reads each expert only once during prefill, eliminating redundant SSD reads.
+- **DRAM BW and GPU utilization rise** (q2 b32 DRAM 120→130, GPU 80.6→84.6%; q4 b80 GPU 64.4→71.7%) — less time idling on SSD, so compute makes progress.
+- Total power and GPU power are roughly flat to slightly lower: the gain comes with no increase in power (max is an instantaneous spike and run-dependent).

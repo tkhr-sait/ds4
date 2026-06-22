@@ -31,6 +31,12 @@
 - [8. システムメトリクス (mactop)](#8-システムメトリクス-mactop)
   - [8a. baseline 基準チャート](#8a-baseline-基準チャート-q4-b80)
   - [8b. 方式間で差が大きい項目](#8b-方式間で差が大きい項目すべて-q4-b80)
+- [9. nommap 改良版 再計測（post-fix, commit `116b936`）](#9-nommap-改良版-再計測post-fix-commit-116b936)
+  - [9a. 要点](#9a-要点)
+  - [9b. Prefill スループット（旧→新, Δ vs baseline）](#9b-prefill-スループット旧新-δ-vs-baseline)
+  - [9c. Generation スループット（新, gen tok 付き）](#9c-generation-スループット新-gen-tok-付き)
+  - [9d. メモリ（PhysMem ピーク / vm_stat）](#9d-メモリphysmem-ピーク--vm_stat)
+  - [9e. システムメトリクス（mactop, 代表 run 旧→新）](#9e-システムメトリクスmactop-代表-run-旧新)
 
 ---
 
@@ -531,3 +537,139 @@ DRAM BW の絶対値は gen t/s と比例しない。**nommap は BW 最高（11
 - **baseline（低 BW・中 t/s）**: BW が低いのは、thrash の page fault / SSD I/O 待ちで **メモリを触る時間そのものが短い**ため（**GPU稼働 59% が最低**）。一方 cache hit した瞬間は GPU が mmap ページを直読でき、freq は 1355 と高いので、stall していない区間の効率で gen 11.00 を保つ。
 - **CPU usage はどの方式も低い（3–6%）**: pread 発行と GEMM ディスパッチが主で、重い処理は GPU 側。nommap が CPU 3.0% と最低なのも I/O 待ちを反映。p-cluster freq は ~3.5 GHz で横並び（CPU は律速でない）。
 - → gen t/s を決めるのは **GPU が weight を待たずに連続して MoE を回せるか（GPU稼働率・GPU freq）** であって、DRAM BW の絶対値ではない。BW が高くてもその実体が I/O コピーなら速度に寄与しない。
+
+---
+
+## 9. nommap 改良版 再計測（post-fix, commit `116b936`）
+
+再計測日: 2026-06-21 / 機材・モデル・ワークロードは §3 と同一 / 対象ログ: `/workspace/logs/no-mmap-brushup/`
+
+本レポート初版（commit `ee5f2f9`, nommap = `cae5e95`）以降に入った **nommap 改良 3 コミット**を適用して nommap のみ再計測した結果。§1〜§8 の数値は初版（`cae5e95` 期）のまま据え置き、本節は post-fix 値を**追記**する（baseline / residency-lru / full は再計測していないので §6/§8 の値を比較基準に使う）。
+
+- `f4a1114` … no-mmap × `--quality` decode 修正 + teardown buffer 解放（ds4_test で表面化した正しさ修正。本計測の速度・メモリ値には非寄与）
+- `7af0623` … no-mmap prefill **Double Buffer in-place reuse**（prefill DB を別バッファで持たず gen slab に畳み込む。wired 規律の改良＝§9a② / §9d。起動ログ表記は `DB`）
+- `116b936` … no-mmap prefill **layer-major over chunks**（処理順を入れ替えて各 expert を prefill 中 1 回だけ読む＝高速化の主役＝§9a①）
+
+計測条件・代表値の定義（prefill = 最大 prefill 10,652 tok の 100.0% 最終 avg、gen = 最長 gen 系列の最終 avg、PhysMem ピーク、vm_stat 集計、mactop 集計）は §3/§6/§7/§8 と同一。起動ログで `DS4_METAL_ENABLE_STREAMING_NO_MMAP enabled` と `nommap DB in-place reuse: ON`（Double Buffer in-place reuse の意。ログだけ `DB` と略記）を確認済。budget 80 は ds4 が 75 GiB に cap（§3 と同じ ~70% 上限）。
+
+### 9a. 要点
+
+- **prefill の改良は 2 つ**。
+  - **① layer-major over chunks（処理順入れ替え）= 高速化の主役**。各層 expert を prefill 中 1 回だけ読むよう順序を組み替え、冗長な SSD read を削減（旧 chunk-major は chunk ごとに再読込。§9e の disk read 減と整合）。**q4 は約 2 倍**（b32 117.5→**218.4** / b80 126.7→**231.5**）で **residency-lru（b80 129.2）も baseline（113.2）も上回り q4 prefill 最速**（b80 baseline 比 **+118** / r-lru 比 **+102**）。**q2 も高 budget で baseline 逆転**（b80 215.2→**249.9**、+35.7）、低 budget の劣化も縮小（b8 −42.4 → **−8.6**）。
+  - **② Double Buffer in-place reuse = wired 規律の改良**（速度には非寄与）。prefill double-buffer を別 MTLBuffer で確保せず既存 gen slab に上書き pread し、per-prompt の orphan/churn を消す。**単発ピーク wired は下げない**が、長時間・反復でも total を budget+固定分 内に保つ（詳細 §9d）。
+- **gen はほぼ不変**（最長系列 avg: q4 b80 9.01→**8.65**、q2 b80 19.92→**19.06**。gen tok が run ごとに変動するため誤差内）。② はメモリ規律の改良で gen 速度には非寄与（旧 nommap も gen は full budget だったため挙動は不変）。q2 b80 gen は baseline（19.37）にほぼ並ぶが僅かに下（−0.31）で、旧版の「baseline 逆転」は run 変動の範囲。
+- **省メモリは維持**。file-backed **≈1.2–2.8 GiB** / compressor **0** / swapout **0** を全 budget で堅持し、used / wired / unused も §6c と同水準（§9d）。prefill 高速化と RAM フットプリント最小を**両立**。
+
+### 9b. Prefill スループット（旧→新, Δ vs baseline）
+
+baseline / residency-lru は §6a（`cae5e95` 期）の据え置き値。**nommap 新**は post-fix 実測。
+
+**q2**
+
+| budget(GiB) | baseline | nommap 旧 | **nommap 新（Δ vs baseline）** |
+|---|---|---|---|
+| 8 | 248.9 | 206.5 | **240.3（−8.6）** |
+| 16 | 248.7 | 210.1 | **242.0（−6.7）** |
+| 32 | 249.3 | 214.6 | **239.6（−9.7）** |
+| 64 | 212.5 | 215.9 | **251.1（+38.6）** |
+| 80 | 214.2 | 215.2 | **249.9（+35.7）** |
+
+**q4**（residency-lru も併記＝本改良の主役比較）
+
+| budget(GiB) | baseline | residency-lru | nommap 旧 | **nommap 新（Δ vs baseline / vs r-lru）** |
+|---|---|---|---|---|
+| 8 | 131.2 | 131.6 | 117.1 | **205.1（+73.9 / +73.5）** |
+| 16 | 128.8 | 131.9 | 113.9 | **207.0（+78.2 / +75.1）** |
+| 32 | 120.6 | 136.0 | 117.5 | **218.4（+97.8 / +82.4）** |
+| 64 | 117.6 | 133.0 | 123.5 | **227.3（+109.7 / +94.3）** |
+| 80 | 113.2 | 129.2 | 126.7 | **231.5（+118.3 / +102.3）** |
+
+### 9c. Generation スループット（新, gen tok 付き）
+
+t/s = 最長 gen 系列の最終 avg、括弧 = Δ t/s vs baseline（§6b）と最終 gen tok。
+
+**q2**
+
+| budget(GiB) | baseline | nommap 旧 | **nommap 新（Δ vs baseline, tok）** |
+|---|---|---|---|
+| 8 | 14.95 | 4.52 | **4.77（−10.18, 1732）** |
+| 16 | 17.12 | 6.54 | **6.57（−10.55, 2096）** |
+| 32 | 19.29 | 12.16 | **11.70（−7.59, 1955）** |
+| 64 | 20.27 | 19.57 | **19.54（−0.73, 1766）** |
+| 80 | 19.37 | 19.92 | **19.06（−0.31, 1864）** |
+
+**q4**
+
+| budget(GiB) | baseline | nommap 旧* | **nommap 新（Δ vs baseline, tok）** |
+|---|---|---|---|
+| 8 | 8.86 | 2.12 | **2.07（−6.79, 3137）** |
+| 16 | 9.31 | 2.68* | **2.63（−6.68, 1955）** |
+| 32 | 8.98 | 3.60 | **3.58（−5.40, 2569）** |
+| 64 | 9.00 | 7.03* | **7.01（−1.99, 1795）** |
+| 80 | 11.00 | 9.01* | **8.65（−2.35, 3151）** |
+
+> \* 旧 nommap q4 の b16/b64/b80 は §6b 掲載値が**最初のセッションの avg**（2.73 / 7.23 / 7.59）を拾っていた。本節は §3 定義どおり**最長 gen 系列の avg**に統一した旧値（2.68 / 7.03 / 9.01）と並べる。新値も最長系列 avg。gen は旧→新で実質横ばい（run 変動内）。
+
+### 9d. メモリ（PhysMem ピーク / vm_stat）
+
+**PhysMem ピーク（新 nommap）** — §6c と同形式。
+
+| quant | budget(GiB) | used(GiB) | wired(GiB) | compressor(GiB) | min unused(GiB) | swapout |
+|---|---|---|---|---|---|---|
+| q2 | 8 | 38 | 23 | 0.0 | 89.0 | 0 |
+| q2 | 16 | 46 | 32 | 0.0 | 81.0 | 0 |
+| q2 | 32 | 62 | 45 | 0.0 | 65.0 | 0 |
+| q2 | 64 | 90 | 77 | 0.0 | 37.0 | 0 |
+| q2 | 80 | 101 | 88 | 0.0 | 26.0 | 0 |
+| q4 | 8 | 41 | 24 | 0.0 | 86.0 | 0 |
+| q4 | 16 | 49 | 31 | 0.0 | 78.0 | 0 |
+| q4 | 32 | 66 | 47 | 0.0 | 62.0 | 0 |
+| q4 | 64 | 97 | 79 | 0.0 | 30.0 | 0 |
+| q4 | 80 | 108 | 90 | 0.0 | 19.0 | 0 |
+
+**vm_stat 瞬間ピーク（新 nommap, GiB）** — §7a/§7c と同形式。
+
+| quant | budget | wired | **file-backed** | anonymous | compressed | inactive | min free |
+|---|---|---|---|---|---|---|---|
+| q2 | 8 | 22.9 | 2.8 | 25.9 | 0.0 | 12.0 | 87.8 |
+| q2 | 16 | 28.6 | 2.7 | 26.3 | 0.0 | 10.9 | 79.5 |
+| q2 | 32 | 49.7 | 1.9 | 25.9 | 0.0 | 10.9 | 63.7 |
+| q2 | 64 | 77.1 | 1.2 | 23.0 | 0.0 | 9.6 | 35.9 |
+| q2 | 80 | 88.0 | 2.0 | 28.6 | 0.0 | 11.4 | 24.4 |
+| q4 | 8 | 22.6 | 2.3 | 28.7 | 0.0 | 11.8 | 85.3 |
+| q4 | 16 | 30.4 | 2.7 | 29.0 | 0.0 | 11.6 | 76.7 |
+| q4 | 32 | 46.7 | 2.2 | 29.0 | 0.0 | 12.5 | 60.7 |
+| q4 | 64 | 78.6 | 1.8 | 29.7 | 0.0 | 12.3 | 29.5 |
+| q4 | 80 | 89.7 | 1.7 | 29.4 | 0.0 | 11.6 | 18.3 |
+
+**vm_stat 累積/イベント（新 nommap, run 全体）** — §7b/§7d と同形式。
+
+| quant | budget | faults | pageins(GiB) | pageout | comprs | dcomprs | swapout(pages) |
+|---|---|---|---|---|---|---|---|
+| q2 | 8 | 2523k | 1.6 | 0 | 0k | 0k | 0 |
+| q2 | 16 | 2855k | 1.4 | 0 | 0k | 0k | 0 |
+| q2 | 32 | 3656k | 1.1 | 0 | 0k | 0k | 0 |
+| q2 | 64 | 5619k | 0.6 | 0 | 0k | 0k | 0 |
+| q2 | 80 | 5911k | 1.0 | 0 | 0k | 0k | 0 |
+| q4 | 8 | 3945k | 1.4 | 0 | 0k | 0k | 0 |
+| q4 | 16 | 3739k | 1.5 | 0 | 0k | 0k | 0 |
+| q4 | 32 | 4579k | 1.3 | 0 | 0k | 0k | 0 |
+| q4 | 64 | 6055k | 0.9 | 0 | 0k | 0k | 0 |
+| q4 | 80 | 6849k | 1.0 | 0 | 0k | 0k | 0 |
+
+file-backed ≈1.2–2.8 GiB・compressed/comprs/dcomprs/swapout = 0 は §7e の nommap 所見そのまま。prefill が約 2 倍になっても OS page cache を一切使わない設計は崩れていない。
+
+**wired は旧 nommap とほぼ同水準で「削減」ではない**（§6c 比 q4 b80 88→90、q2 b80 85→88）。この ~2 GiB 差は**環境ノイズ**: ds4 のプロセス RSS は q4 b80 で **旧 90.3 = 新 90.3 GiB**（mactop `rss_kb`、差 0.6 MB）で完全同一なので、system-wide wired のずれは他アプリ/OS の baseline 差（ds4 起動前の idle `used` 旧 8.8→新 11.0 GiB）であって ds4 のフットプリントは不変。設計上も total は budget+固定分 ~11 GiB に張り付き（§9a②）、Double Buffer in-place reuse はピーク低減ではなく orphan/churn 回避の規律改良。
+
+### 9e. システムメトリクス（mactop, 代表 run 旧→新）
+
+| run | 総電力 W (avg/max) | GPU電力 W (avg) | DRAM BW GB/s (avg) | disk read MB/s (avg/max) | GPU温度 ℃ (max) | GPU稼働 % (avg) |
+|---|---|---|---|---|---|---|
+| q2 nommap b32 旧 | 54.4 / 123.1 | 14.8 | 120.0 | 2299 / 5013 | 100.8 | 80.6 |
+| **q2 nommap b32 新** | 52.8 / 128.2 | 13.5 | **129.6** | **1673** / 2887 | 101.3 | **84.6** |
+| q4 nommap b80 旧 | 36.3 / 81.6 | 7.9 | 110.0 | 2597 / 6080 | 99.4 | 64.4 |
+| **q4 nommap b80 新** | 34.8 / 131.5 | 6.7 | **115.9** | **2071** / 6076 | 101.1 | **71.7** |
+
+- **disk read avg が低下**（q2 b32 2299→**1673**、q4 b80 2597→**2071**）。layer-major で各 expert を prefill 中 1 回しか読まなくなり、冗長な SSD read が消えた直接の証拠。
+- **DRAM BW・GPU 稼働率が上昇**（q2 b32 DRAM 120→130・GPU 80.6→84.6%、q4 b80 GPU 64.4→71.7%）。SSD 待ちで GPU が遊ぶ時間が減り、演算が前に進むようになった分。
+- 総電力・GPU 電力はほぼ横ばい〜微減で、性能向上を電力増なしに得ている（max は瞬間スパイクで run 依存）。
