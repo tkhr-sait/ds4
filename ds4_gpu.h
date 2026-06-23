@@ -64,6 +64,14 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
  * page cache.  fd < 0 disables the no-cache path.  No-op on CUDA/ROCm, which
  * have their own O_DIRECT staging. */
 int ds4_gpu_stream_nommap_set_fd(int fd, size_t align);
+/* DS4_METAL_ENABLE_MMAP_LAYER_MAJOR: a prefill-only F_NOCACHE fd used when the model IS
+ * mmapped (no-mmap mode off).  The mmap layer-major prefill driver preads routed
+ * whole-tensors through it into the owned routed double-buffer (read-once, deep-queue);
+ * gen keeps streaming via the mmap.  fd < 0 disables.  _active reports if installed.
+ * _set_owned_routed_active toggles the owned-routed batch path for the prefill loop. */
+int ds4_gpu_set_stream_prefill_nocache_fd(int fd, size_t align);
+int ds4_gpu_stream_prefill_fd_active(void);
+void ds4_gpu_stream_set_owned_routed_active(int on);
 /* DS4_METAL_ENABLE_STREAMING_NO_MMAP owned PERSIST tier: every NON-routed tensor is pread once into
  * a Metal-owned Shared buffer (no mmap, no page cache) and registered so the
  * kernels read it transparently via ds4_gpu_wrap_model_range.  Built once at

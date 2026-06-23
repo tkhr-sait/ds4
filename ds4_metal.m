@@ -7358,10 +7358,51 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
 static int    g_stream_nommap_fd    = -1;   /* page-cache-bypassing fd (DS4_METAL_ENABLE_STREAMING_NO_MMAP) */
 static size_t g_stream_nommap_align = 0;    /* I/O alignment for g_stream_nommap_fd (1 = none) */
 
+/* DS4_METAL_ENABLE_MMAP_LAYER_MAJOR: a prefill-ONLY page-cache-bypassing fd opened even
+ * when the model IS mmapped (no-mmap mode off, g_stream_nommap_fd < 0).  The mmap
+ * layer-major prefill driver preads routed whole-tensors through it into the owned
+ * routed double-buffer (deep-queue background reads, read-once per prompt) while gen
+ * keeps streaming experts via the mmap (whose page cache the prefill reads also warm,
+ * since F_NOCACHE cannot bypass a mmapped vnode -- that warming makes gen fast).  The
+ * routed DB-fill helpers use the "effective" fd below (no-mmap fd, else this). */
+static int    g_stream_nommap_prefill_fd    = -1;
+static size_t g_stream_nommap_prefill_align = 0;
+
 int ds4_gpu_stream_nommap_set_fd(int fd, size_t align) {
     g_stream_nommap_fd    = fd;
     g_stream_nommap_align = align;
     return 1;
+}
+
+int ds4_gpu_set_stream_prefill_nocache_fd(int fd, size_t align) {
+    g_stream_nommap_prefill_fd    = fd;
+    g_stream_nommap_prefill_align = align;
+    return 1;
+}
+
+/* Effective fd the routed DB-fill preads use: the full no-mmap fd when no-mmap mode is
+ * active, otherwise the prefill-only no-cache fd (mmap mode). */
+static int ds4_gpu_stream_db_fd(void) {
+    return g_stream_nommap_fd >= 0 ? g_stream_nommap_fd : g_stream_nommap_prefill_fd;
+}
+static int ds4_gpu_stream_db_active(void) {
+    return ds4_gpu_stream_db_fd() >= 0;
+}
+/* Public: is the mmap-mode prefill no-cache fd available? (gate predicate) */
+int ds4_gpu_stream_prefill_fd_active(void) {
+    return g_stream_nommap_prefill_fd >= 0;
+}
+
+/* Set ONLY for the duration of the mmap layer-major prefill layer loop (no-mmap mode
+ * off).  While set, the batch routed-MoE encode serves routed experts from the owned
+ * double-buffer (routed_ensure + tier-2) instead of the routed mmap views (the decode
+ * span map excludes routed).  Cleared after the loop so gen is unaffected. */
+static int g_stream_db_owned_routed_active = 0;
+void ds4_gpu_stream_set_owned_routed_active(int on) {
+    g_stream_db_owned_routed_active = on ? 1 : 0;
+}
+static int ds4_gpu_stream_db_owned_routed(void) {
+    return g_stream_nommap_fd >= 0 || g_stream_db_owned_routed_active;
 }
 
 #define DS4_OWNED_MAX 4096
@@ -7712,7 +7753,7 @@ static uint32_t ds4_gpu_stream_nommap_routed_pread_split(void) {
  * into p->err and the caller waits on the whole group. */
 static void ds4_gpu_stream_nommap_routed_fill_submit(ds4_gpu_stream_nommap_routed_parity *p,
                                                      uint8_t *dst, uint64_t page_off, uint64_t want) {
-    const int fd = g_stream_nommap_fd;
+    const int fd = ds4_gpu_stream_db_fd();   /* no-mmap fd, or the mmap-mode prefill no-cache fd */
     const uint64_t page = (uint64_t)getpagesize();
     /* Keep at least 64 MiB of payload per sub-range so small tensors are not
      * over-split into sub-bandwidth reads. */
@@ -7762,7 +7803,7 @@ static void ds4_gpu_stream_nommap_routed_fill_submit(ds4_gpu_stream_nommap_route
 static int ds4_gpu_stream_nommap_routed_issue(uint64_t model_size,
                                     const uint64_t *offs, const uint64_t *lens,
                                     uint32_t layer_index) {
-    if (g_stream_nommap_fd < 0) return 0;
+    if (!ds4_gpu_stream_db_active()) return 0;
     const uint32_t parity = layer_index & 1u;
     const uint32_t base   = parity * 3u;
     ds4_gpu_stream_nommap_routed_parity *p = &g_stream_nommap_routed_pf[parity];
@@ -7855,7 +7896,7 @@ int ds4_gpu_stream_nommap_routed_prefetch(uint64_t model_size,
 static int ds4_gpu_stream_nommap_routed_ensure(uint64_t model_size,
                                     const uint64_t *offs, const uint64_t *lens,
                                     uint32_t layer_index) {
-    if (g_stream_nommap_fd < 0) return 0;
+    if (!ds4_gpu_stream_db_active()) return 0;
     const uint32_t parity = layer_index & 1u;
     const uint32_t base   = parity * 3u;
     ds4_gpu_stream_nommap_routed_parity *p = &g_stream_nommap_routed_pf[parity];
@@ -26500,7 +26541,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              * mid-layer transient-clear + cache-evict corrupted the FFN tail and
              * the KV).  Double-buffered by layer parity so the reused buffer is
              * never the one the previous layer's still-in-flight GEMM reads. */
-            if (g_stream_nommap_fd >= 0) {
+            if (ds4_gpu_stream_db_owned_routed()) {
                 const uint64_t r_off[3] = { gate_offset, up_offset, down_offset };
                 const uint64_t r_len[3] = { gate_tensor_bytes, gate_tensor_bytes,
                                             down_tensor_bytes };
@@ -26570,7 +26611,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          * buffer GPU-resident on macOS 15+; without this the routed GEMM reads
          * garbage -> corrupt KV -> BOS-repeat (#388 shows the same wrap path is
          * correct when the experts come from already-resident mmap views). */
-        if (g_stream_nommap_fd >= 0 && g_stream_nommap_routed_resset &&
+        if (ds4_gpu_stream_db_owned_routed() && g_stream_nommap_routed_resset &&
             [cb respondsToSelector:@selector(useResidencySet:)]) {
             [cb useResidencySet:g_stream_nommap_routed_resset];
         }

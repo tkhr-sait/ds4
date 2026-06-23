@@ -2411,6 +2411,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
  * On any failure the open helper returns -1 and callers fall back to mmap. */
 static int    g_stream_nommap_fd    = -1;     /* engine-wide page-cache-bypassing fd */
 static size_t g_stream_nommap_align = 0;      /* I/O alignment for g_stream_nommap_fd (1 = none) */
+static int    g_stream_prefill_nocache_fd = -1; /* DS4_METAL_ENABLE_MMAP_LAYER_MAJOR prefill-only no-cache fd (mmap mode) */
 
 /* Read DS4_METAL_ENABLE_STREAMING_NO_MMAP once.  model/engine open run single-threaded at startup,
  * so the unguarded static cache is safe here. */
@@ -21276,7 +21277,15 @@ static bool metal_graph_prefill_nommap_layer_major(
         const token_vec *prompt, uint32_t start, uint32_t n_tokens,
         float *logits, bool show_progress,
         ds4_session_progress_fn display_progress, void *display_progress_ud,
-        ds4_session_cancel_fn cancel, void *cancel_ud, bool *cancelled) {
+        ds4_session_cancel_fn cancel, void *cancel_ud, bool *cancelled,
+        bool mmap_decode_map) {
+    /* mmap_decode_map: the model IS mmapped (no-mmap mode off) and a prefill-only
+     * no-cache fd serves the routed double-buffer.  Map each layer with the
+     * routed-EXCLUDING decode span set so routed mmap pages do not also wire into
+     * g_model_views; routed experts are served from the owned double-buffer pread
+     * through the effective DB fd (read-once, deep-queue).  Gen keeps using the mmap
+     * (warmed by these reads).  When false this is the original no-mmap (owned-pread)
+     * driver, byte-identical. */
     if (n_tokens == 0 || g->prefill_cap == 0 || DS4_N_LAYER == 0) return false;
     const uint32_t cap      = g->prefill_cap;
     const uint32_t end      = start + n_tokens;
@@ -21287,8 +21296,8 @@ static bool metal_graph_prefill_nommap_layer_major(
     /* one-time confirmation that the driver actually engaged (the gate is subtle). */
     static int lm_logged = 0;
     if (!lm_logged) {
-        fprintf(stderr, "ds4: nommap layer-major prefill ENGAGED (chunks=%u, cap=%u, tokens=%u)\n",
-                n_chunks, cap, n_tokens);
+        fprintf(stderr, "ds4: %s layer-major prefill ENGAGED (chunks=%u, cap=%u, tokens=%u)\n",
+                mmap_decode_map ? "mmap" : "nommap", n_chunks, cap, n_tokens);
         lm_logged = 1;
     }
 
@@ -21314,8 +21323,10 @@ static bool metal_graph_prefill_nommap_layer_major(
     const uint32_t last_n = DS4_LM_CHUNK_LEN(n_chunks - 1u);
     if (ok && last_n != cap) ok = metal_graph_warmup_prefill_kernels(g, model, weights, last_n);
 
-    /* engage the in-place DB slab reservation once (sizes from layer 0). */
-    if (ok && DS4_N_LAYER > 0) {
+    /* engage the in-place DB slab reservation once (sizes from layer 0).  no-mmap only:
+     * the mmap path serves routed from the owned double-buffer (read via the prefill
+     * no-cache fd), not gen-cache DB slabs. */
+    if (ok && !mmap_decode_map && DS4_N_LAYER > 0) {
         const ds4_layer_weights *l0 = &weights->layer[0];
         if (l0->ffn_gate_exps && l0->ffn_up_exps && l0->ffn_down_exps) {
             const uint64_t g_row = routed_expert_row_bytes(l0->ffn_gate_exps);
@@ -21341,13 +21352,23 @@ static bool metal_graph_prefill_nommap_layer_major(
 
     metal_graph_stream_prefill_selected_profile_reset(g);
 
+    /* mmap_decode_map: route the batch routed-MoE encode to the owned double-buffer for
+     * the layer loop's duration (the decode span map excludes routed mmap views). */
+    if (mmap_decode_map) ds4_gpu_stream_set_owned_routed_active(1);
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) {
             cancelled_local = true;
             break;
         }
         g->streaming_static_decode_map_current = false;
-        if (!metal_graph_stream_map_layer(model, weights, il)) { ok = false; break; }
+        /* mmap_decode_map: map with the routed-EXCLUDING decode span set (routed served
+         * by the owned double-buffer below).  no-mmap: full whole-tensor map (a no-op
+         * install under no_mmap anyway; owned tiers shadow it). */
+        const bool map_ok = mmap_decode_map
+            ? metal_graph_stream_map_layer_decode(model, weights, il)
+            : metal_graph_stream_map_layer(model, weights, il);
+        if (!map_ok) { ok = false; break; }
         /* prefetch layer il+1's whole gate/up/down expert tensors so its F_NOCACHE
          * read overlaps ALL of layer il's chunks (an n_chunks-times wider compute
          * window than the chunk-major path, so the read hides easily). */
@@ -21392,6 +21413,8 @@ static bool metal_graph_prefill_nommap_layer_major(
         gpu_graph_report_prefill_display_progress(display_progress, display_progress_ud,
                                                   start, n_tokens, il + 1u, prompt->len);
     }
+    /* clear the owned-routed batch routing before the output head / gen (mmap mode). */
+    if (mmap_decode_map) ds4_gpu_stream_set_owned_routed_active(0);
     if (show_progress) fputc('\n', stderr);
     if (ok && !cancelled_local) metal_graph_stream_prefill_selected_profile_summary(g);
 
@@ -21435,6 +21458,40 @@ static bool metal_graph_prefill_nommap_layer_major(
     #undef DS4_LM_CHUNK_BEG
     #undef DS4_LM_CHUNK_LEN
     return ok;
+}
+
+/* mmap counterpart of the no-mmap layer-major gate: engages the same driver (with
+ * mmap_decode_map=true) when the model IS mmapped (no-mmap mode off) and a prefill-only
+ * no-cache fd was opened (DS4_METAL_ENABLE_MMAP_LAYER_MAJOR).  Routed experts are read
+ * once per prompt into the owned double-buffer (deep-queue F_NOCACHE pread); gen keeps
+ * streaming via the mmap (warmed by those reads).  Same structural conditions as the
+ * no-mmap gate; mutually exclusive with it on the g_stream_nommap_fd polarity. */
+static bool metal_graph_prefill_mmap_layer_major_applies(
+        ds4_gpu_graph *g, const ds4_weights *weights,
+        uint32_t start, uint32_t n_tokens, ds4_imatrix_collector *imatrix) {
+    if (!g->ssd_streaming || g_stream_nommap_fd >= 0) return false;   /* mmap mode only */
+    if (!ds4_gpu_stream_prefill_fd_active()) return false;   /* DS4_METAL_ENABLE_MMAP_LAYER_MAJOR off / fd open failed */
+    if (getenv("DS4_METAL_DISABLE_MMAP_LAYER_MAJOR") != NULL) return false;
+    if (imatrix != NULL) return false;
+    if (start != 0) return false;
+    if (g->prefill_cap == 0 || n_tokens <= g->prefill_cap) return false;   /* multi-chunk only */
+    if (metal_graph_stream_prefill_batch_selected_addr_enabled(g, weights, g->prefill_cap) ||
+        metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, weights, g->prefill_cap)) {
+        return false;
+    }
+    if (metal_graph_stream_prefill_layer_pagein_enabled(g) ||
+        metal_graph_stream_prefill_layer_readahead_enabled(g)) {
+        return false;
+    }
+    uint32_t max_chunks = 32u;
+    const char *mc = getenv("DS4_METAL_MMAP_LAYER_MAJOR_MAX_CHUNKS");
+    if (mc && mc[0]) {
+        char *e = NULL; unsigned long v = strtoul(mc, &e, 10);
+        if (e != mc && *e == '\0' && v >= 2 && v <= 4096) max_chunks = (uint32_t)v;
+    }
+    const uint32_t n_chunks = (n_tokens + g->prefill_cap - 1u) / g->prefill_cap;
+    if (n_chunks > max_chunks) return false;
+    return true;
 }
 
 static bool metal_graph_prefill_chunked_range(
@@ -21506,7 +21563,7 @@ static bool metal_graph_prefill_chunked_range(
         bool lm_cancelled = false;
         const bool lm_ok = metal_graph_prefill_nommap_layer_major(
             g, model, weights, prompt, start, n_tokens, logits, show_progress,
-            display_progress, display_progress_ud, cancel, cancel_ud, &lm_cancelled);
+            display_progress, display_progress_ud, cancel, cancel_ud, &lm_cancelled, false);
         if (!lm_ok) {
             if (g->ssd_streaming && g_stream_nommap_fd >= 0 &&
                 ds4_gpu_stream_nommap_db_reuse_engaged()) {
@@ -21522,6 +21579,27 @@ static bool metal_graph_prefill_chunked_range(
             display_progress(display_progress_ud, "prefill_display", (int)end, prompt->len);
         }
         pos0_init = end;   /* loop body below is skipped; shared tail still runs */
+    } else if (metal_graph_prefill_mmap_layer_major_applies(g, weights, start, n_tokens, imatrix)) {
+        /* mmap counterpart: same driver with mmap_decode_map=true -- routed served from
+         * the owned double-buffer via the prefill no-cache fd (read-once), gen keeps the
+         * mmap.  On failure release the owned routed tier (the shared tail handles the
+         * success path; it fires for the prefill-fd-active case too). */
+        bool lm_cancelled = false;
+        const bool lm_ok = metal_graph_prefill_nommap_layer_major(
+            g, model, weights, prompt, start, n_tokens, logits, show_progress,
+            display_progress, display_progress_ud, cancel, cancel_ud, &lm_cancelled, true);
+        if (!lm_ok) {
+            ds4_gpu_stream_nommap_routed_release();
+            return false;
+        }
+        if (lm_cancelled && cancelled) *cancelled = true;
+        if (progress) {
+            progress(progress_ud, "prefill_chunk", (int)end, prompt->len);
+        }
+        if (display_progress) {
+            display_progress(display_progress_ud, "prefill_display", (int)end, prompt->len);
+        }
+        pos0_init = end;
     }
 
     for (uint32_t pos0 = pos0_init; pos0 < end; ) {
@@ -21596,7 +21674,11 @@ static bool metal_graph_prefill_chunked_range(
      * db_end_prefill (return the in-place DB slabs to gen, no free) when the DB
      * reuse path engaged this prompt, else to the legacy separate-buffer release
      * (reuse OFF / q2-PRO >=2GiB fallback) -- byte-for-byte the old behavior. */
-    if (g->ssd_streaming && g_stream_nommap_fd >= 0) {
+    if (g->ssd_streaming &&
+        (g_stream_nommap_fd >= 0 || ds4_gpu_stream_prefill_fd_active())) {
+        /* mmap layer-major prefill also populates the owned routed double-buffer (via
+         * the prefill no-cache fd); release it here too so it is not wired through gen.
+         * Idempotent (no-op when nothing was allocated, e.g. the chunk-major path). */
         ds4_gpu_stream_nommap_routed_end_prefill();
     }
     if (profile) {
@@ -26346,6 +26428,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     g_stream_nommap_fd, g_stream_nommap_align);
             (void)ds4_gpu_stream_nommap_set_fd(g_stream_nommap_fd, g_stream_nommap_align);
         }
+        /* DS4_METAL_ENABLE_MMAP_LAYER_MAJOR: when the model IS mmapped (no-mmap mode
+         * off), open a prefill-only F_NOCACHE fd so the layer-major mmap prefill driver
+         * preads routed whole-tensors into the owned routed double-buffer (read-once,
+         * deep-queue background I/O).  Gen still streams via the mmap (and benefits from
+         * the page cache these reads warm).  Non-fatal: on failure the prefill falls
+         * back to the legacy chunk-major mmap path. */
+        if (!e->model.no_mmap && getenv("DS4_METAL_ENABLE_MMAP_LAYER_MAJOR") != NULL &&
+            g_stream_prefill_nocache_fd < 0) {
+            g_stream_prefill_nocache_fd = ds4_nocache_open(opt->model_path);
+            if (g_stream_prefill_nocache_fd < 0) {
+                fprintf(stderr,
+                        "ds4: DS4_METAL_ENABLE_MMAP_LAYER_MAJOR: prefill no-cache fd open failed; "
+                        "mmap prefill stays chunk-major\n");
+            } else {
+                const size_t pf_align = ds4_nocache_alignment(g_stream_prefill_nocache_fd);
+                (void)ds4_gpu_set_stream_prefill_nocache_fd(g_stream_prefill_nocache_fd, pf_align);
+                fprintf(stderr,
+                        "ds4: DS4_METAL_ENABLE_MMAP_LAYER_MAJOR enabled (prefill no-cache fd=%d, align=%zu)\n",
+                        g_stream_prefill_nocache_fd, pf_align);
+            }
+        }
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
@@ -26651,6 +26754,13 @@ void ds4_engine_close(ds4_engine *e) {
         close(g_stream_nommap_fd);
         g_stream_nommap_fd = -1;
         g_stream_nommap_align = 0;
+    }
+    if (g_stream_prefill_nocache_fd >= 0) {
+        close(g_stream_prefill_nocache_fd);
+        g_stream_prefill_nocache_fd = -1;
+#ifndef DS4_NO_GPU
+        (void)ds4_gpu_set_stream_prefill_nocache_fd(-1, 0);   /* clear the GPU TU's copy */
+#endif
     }
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
